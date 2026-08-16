@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Document</title>
+    
+    <style>
+        #grid {
+            display: inline-grid;
+            grid-template-columns: repeat(36, 26px);
+            gap: 1px;
+            background: #333;
+            padding: 1px;
+        }
+        .cell {
+            width: 26px;
+            height: 24px;
+            background: #d4b855;
+            border: none;
+            text-align: center;
+            font-size: 12px;
+        }
+    </style>
+</head>
+<body>
+    <div id="grid"></div>
+    <script src="game.js"></script>
+    <script src="grid.js"></script>
+    
+</body>
+</html>
