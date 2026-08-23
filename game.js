@@ -419,6 +419,7 @@ class Board {
 
         this.board[0][17] = PIECES[1000].copy(0, 17)
         this.board[35][18] = PIECES[11000].copy(35, 18)
+        this.board[35][18].invert_color()
     }
 }
 
@@ -539,7 +540,6 @@ class Piece {
 
         // return
 
-        console.log(moves.includes(10 * 36 + 17))
         moves = [...new Set(moves)].map((value) => [Math.floor(value / 36), value % 36])
         return moves
     }
@@ -548,8 +548,8 @@ class Piece {
 const NONE = [0,0,0,0,0,0,0,0]
 const Q = [99,99,99,99,99,99,99,99]
 const PIECES = {
-    1000: new Piece(1000, "King", "王将", [2,2,2,2,2,2,2,2]),
-    11000: new Piece(11000, "King", "玉将", [2,2,2,2,2,2,2,2], color=1),
+    1000: new Piece(1000, "King", "<b>王将</b>", [2,2,2,2,2,2,2,2]),
+    11000: new Piece(11000, "King", "<b>玉将</b>", [2,2,2,2,2,2,2,2]),
     0: new Piece(0, "Empty", ""),
     1: new Piece(1, "Pawn", "歩兵", [1,0,0,0,0,0,0,0]),
     2: new Piece(2, "Earth General", "土将", [1,0,0,0,1,0,0,0]),
@@ -808,5 +808,98 @@ const PIECES = {
     247: new Piece(247, "Great Shark", "大鱗", [99,5,99,2,99,2,99,5]), // PROMOTE
     248: new Piece(248, "Crossbow General", "弓将", [99,5,3,0,2,0,3,5]), // PROMOTE
     249: new Piece(249, "Playful Parrot", "遊䳇", [99,3,5,2,99,2,5,3]), // PROMOTE
+    250: new Piece(250, "Cassia Horse", "桂馬", NONE, [
+        [2, 1, NONE], [2, -1, NONE]
+    ]),
+    251: new Piece(251, "Flying Dragon", "飛龍", NONE, [
+        [2, 2, NONE], [2, -2, NONE],
+        [-2, -2, NONE], [-2, 2, NONE]
+    ]),
+    252: new Piece(252, "Kirin", "麒麟", [1,1,0,1,1,1,0,1], [
+        [0, 2, NONE], [0, -2, NONE]
+    ]),
+    253: new Piece(253, "Phoenix", "鳳凰", [1,0,1,0,1,0,1,0], [
+        [2, 2, NONE], [2, -2, NONE],
+        [-2, -2, NONE], [-2, 2, NONE]
+    ]),
+    254: new Piece(254, "Flying Cat", "飛猫", [0,0,0,1,1,1,0,0], [
+        [0, 3, NONE], [3, 3, NONE], [3, 0, NONE],
+        [0, -3, NONE], [3, -3, NONE]
+    ]),
+    255: new Piece(255, "Running Horse", "走馬", [99,99,0,0,1,0,0,99], [
+        [-2, 2, NONE], [-2, -2, NONE]
+    ]),
+    256: new Piece(256, "Mountain Hawk", "山鷹", [99,99,99,2,99,2,99,99], [
+        [2, 0, NONE]
+    ]),
+    257: new Piece(257, "Little Turtle", "小亀", [99,99,2,99,99,99,2,99], [
+        [2, 0, NONE], [-2, 0, NONE]
+    ]),
+    258: new Piece(258, "Great Stag", "大鹿", [99,0,99,2,99,2,99,0], [
+        [2, 2, NONE], [2, -2, NONE]
+    ]),
+    259: new Piece(259, "Left Mountain Eagle", "左鷲", [99,99,2,99,99,99,99,99], [
+        [-2, -2, NONE], [2, -2, NONE]
+    ]),
+    260: new Piece(260, "Right Mountain Eagle", "右鷲", [99,99,99,99,99,2,99,99], [
+        [-2, 2, NONE], [2, 2, NONE]
+    ]),
+    261: new Piece(261, "Kirin Master", "麟師", [99,99,3,99,99,99,3,99], [
+        [3, 0, NONE], [-3, 0, NONE]
+    ]),
+    262: new Piece(262, "Great Turtle", "大亀", [99,99,3,99,99,99,3,99], [
+        [3, 0, NONE], [-3, 0, NONE]
+    ]),
+    263: new Piece(263, "Phoenix Master", "鳳師", [99,99,3,99,99,99,3,99], [
+        [3, 3, NONE], [3, -3, NONE]
+    ]),
+    264: new Piece(264, "Great Master", "大師", [99,99,5,5,99,5,5,99], [
+        [3, 0, NONE], [3, 3, NONE], [3, -3, NONE]
+    ]),
+    265: new Piece(265, "Horned Hawk", "角鷹", Q, [
+        [2, 0, NONE]
+    ]),
+    266: new Piece(266, "Flying Eagle", "飛鷲", Q, [
+        [2, 2, NONE], [2, -2, NONE]
+    ]),
+    267: new Piece(267, "Roaring Dog", "吼犬", [99,99,99,3,99,3,99,99], [
+        [3, 0, NONE], [3, 3, NONE],
+        [0, 3, NONE],
+        [-3, 0, NONE],
+        [0, -3, NONE], [3, -3, NONE]
+    ]),
+    268: new Piece(268, "Lion Dog", "狛犬", Q, [
+        [3, 0, NONE], [3, 3, NONE],
+        [0, 3, NONE], [-3, 3, NONE],
+        [-3, 0, NONE], [-3, -3, NONE],
+        [0, -3, NONE], [3, -3, NONE]
+    ]),
+    269: new Piece(269, "Great Dream-Eater", "大獏", Q, [ // PROMOTE
+        [0, 3, NONE], [0, -3, NONE]
+    ]), 
+    270: new Piece(270, "Heavenly Horse", "天馬", [99,0,0,0,0,0,0,0], [ // PROMOTE
+        [2, 1, NONE], [-2, 1, NONE],
+        [-2, -1, NONE], [2, -1, NONE]
+    ]), 
+    271: new Piece(271, "Spirit Turtle", "霊亀", Q, [ // PROMOTE
+        [3, 0, NONE], [0, 3, NONE],
+        [-3, 0, NONE], [0, -3, NONE]
+    ]),
+    272: new Piece(272, "Treasure Turtle", "宝亀", Q, [ // PROMOTE
+        [2, 0, NONE], [0, 2, NONE],
+        [-2, 0, NONE], [0, -2, NONE]
+    ]),
+    273: new Piece(273, "Wooden Dove", "鳩槃", [2,99,2,99,2,99,2,99], [
+        [3, 3, [0,2,0,0,0,0,0,0]], [-3, 3, [0,0,0,2,0,0,0,0]],
+        [-3, -3, [0,0,0,0,0,2,0,0]], [3, -3, [0,0,0,0,0,0,0,2]]
+    ]),
+    274: new Piece(274, "Center Master", "中師", [99,99,3,3,99,3,3,99], [
+        [2, 0, NONE], [2, 2, NONE],
+        [-2, 0, NONE],
+        [2, -2, NONE]
+    ]),
+    275: new Piece(275, "Peng Master", "鵬師", [99,99,5,5,99,5,5,99], [
+        [3, 3, NONE], [3, -3, NONE]
+    ]),
 }
 
