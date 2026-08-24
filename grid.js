@@ -20,6 +20,26 @@ function render() {
             document.getElementById(`cell-${i}-${j}`).style.color = board.board[i][j].color == 0 ? "#ffffff" : "#000000" 
         }
     }
+    if (selected[0] != null) {
+        let moves_able = board.board[selected[0]][selected[1]].get_legal_moves(board)
+        for (let square of moves_able) {
+            document.getElementById(`cell-${Math.floor(square / 36) % 36}-${square % 36}`).style.background = "#888888"
+        }
+    }
+}
+
+function render_special() {
+    clear()
+    let moves_able = board.board[selected[0]][selected[1]].get_legal_moves(board)
+    for (let i of moves_able) {
+        if (i >= 9 * 1296) {
+            console.log("hi")
+            let j = [Math.floor((i - 9 * 1296) / 36) % 36, (i - 9 * 1296) % 36]
+            document.getElementById(`cell-${j[0]}-${j[1]}`).style.background = "#905c4c"
+        } else {
+            console.log(i)
+        }
+    }
 }
 
 function clear() {
@@ -30,12 +50,25 @@ function clear() {
     }
 }
 
-
+selected = [null, null]
 function click(x, y) {
     clear()
-    let moves_able = board.board[x][y].get_legal_moves(board)
-    for (let square of moves_able) {
-        document.getElementById(`cell-${square[0]}-${square[1]}`).style.background = "#888888"
+    if (selected[0] == null) {
+        selected = [x, y]
+        render()
+    } else {
+        let moves_able = board.board[selected[0]][selected[1]].get_legal_moves(board)
+        if (moves_able.includes(1296 * (SHIFT ? 9 : 0) + 36 * x + y)) {
+            board.board[x][y] = board.board[selected[0]][selected[1]].copy(x, y)
+            board.board[selected[0]][selected[1]] = PIECES[0].copy(selected[0], selected[1])
+            selected = [null, null]
+        } else {
+            for (let square of moves_able) {
+                document.getElementById(`cell-${Math.floor(square / 36) % 36}-${square % 36}`).style.background = "#888888"
+            }
+            selected = [null, null]
+            click(x, y)
+        }
     }
     render()
 }
@@ -46,9 +79,35 @@ for (let i = 0; i < 36; i++) {
     }
 }
 
+let SHIFT = false;
+
+window.addEventListener('keydown', (event) => {
+    if (event.key === 'Shift') {
+        SHIFT = true;
+        if (selected[0] != null) {
+            render_special()
+        }
+    }
+});
+
+window.addEventListener('keyup', (event) => {
+    if (event.key === 'Shift') {
+        SHIFT = false
+        if (selected[0] != null) {
+            render()
+        }
+    };
+});
+
+window.addEventListener('mousedown', function(e) {
+    if (e.shiftKey) {
+        e.preventDefault();
+    }
+});
+
 render()
 
-if (confirm('Do you want to random move')) {
+if (false) {//confirm('Do you want to random move')) {
     // Comment this out
     let turn = 1
     let count = 0

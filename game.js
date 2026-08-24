@@ -401,6 +401,37 @@ class Board {
             [243, 0, 26],
             [244, 0, 12],
             [244, 0, 23],
+            [250, 3, 2],
+            [250, 3, 33],
+            [251, 5, 8],
+            [251, 5, 27],
+            [252, 5, 15],
+            [253, 5, 20],
+            [254, 4, 5],
+            [254, 4, 30],
+            [255, 0, 8],
+            [255, 0, 27],
+            [256, 4, 6],
+            [256, 4, 29],
+            [257, 5, 18],
+            [258, 3, 14],
+            [258, 3, 21],
+            [259, 0, 5],
+            [260, 0, 30],
+            [261, 2, 17],
+            [262, 5, 17],
+            [263, 2, 18],
+            [264, 8, 17],
+            [265, 9, 11],
+            [265, 9, 24],
+            [266, 9, 12],
+            [266, 9, 23],
+            [267, 9, 18],
+            [268, 9, 17],
+            [273, 0, 24],
+            [274, 6, 18],
+            [275, 6, 17],
+            [276, 12, 18],
         ]
 
         for (let i of pieces_to_add) {
@@ -411,7 +442,7 @@ class Board {
 
         for (let i = 0; i < 36; i++) {
             for (let j = 0; j < 36; j++) {
-                if (this.board[i][j] == 0) {
+                if (this.board[i][j] === 0) {
                     this.board[i][j] = PIECES[0].copy(i[1], i[2])
                 }
             }
@@ -420,6 +451,13 @@ class Board {
         this.board[0][17] = PIECES[1000].copy(0, 17)
         this.board[35][18] = PIECES[11000].copy(35, 18)
         this.board[35][18].invert_color()
+    }
+
+    getPiece(x, y) {
+        if (out_of_bounds(x) || out_of_bounds(y)) {
+            return null
+        }
+        return this.board[x][y]
     }
 }
 
@@ -451,11 +489,11 @@ class Piece {
     }
 
     is_empty() {
-        return this.id == 0
+        return this.id === 0
     }
 
     is_friendly(piece) {
-        return (this.color == piece.color) && (!(this.id == 0 || piece.id == 0))
+        return (this.color === piece.color) && (!(this.id === 0 || piece.id === 0))
     }
 
     get_legal_moves(board) {
@@ -481,7 +519,7 @@ class Piece {
                 if (out_of_bounds(working_x) || out_of_bounds(working_y)) {
                     break
                 }
-                if ((board.board[working_x][working_y].color == (1 - this.color)) && !board.board[working_x][working_y].is_empty()) {
+                if ((board.board[working_x][working_y].color === (1 - this.color)) && !board.board[working_x][working_y].is_empty()) {
                     moves.push(working_x * 36 + working_y)
                     break
                 }
@@ -521,7 +559,7 @@ class Piece {
                         if (out_of_bounds(working_x) || out_of_bounds(working_y)) {
                             break
                         }
-                        if ((board.board[working_x][working_y].color == (1 - this.color)) && !board.board[working_x][working_y].is_empty()) {
+                        if ((board.board[working_x][working_y].color === (1 - this.color)) && !board.board[working_x][working_y].is_empty()) {
                             moves.push(working_x * 36 + working_y)
                             break
                         }
@@ -537,10 +575,49 @@ class Piece {
         }
 
         // special
+        if (this.id === 276) {
+            for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
+                let max = (dir[0] === 1 && Math.abs(dir[1]) === 1) ? 4 : 3
+                
+                // Can we move that far?
+                if (board.getPiece(base_x + max * dir[0], base_y + max * dir[1]) === null) {
+                    continue
+                }
+
+                // Is there a piece in the area that we can take?
+                let has_friendly = false
+                let has_enemy = false
+                for (let i = 1; i < max + 1; i++) {
+                    let piece = board.getPiece(base_x + i * dir[0], base_y + i * dir[1])
+                    if (this.is_friendly(piece)) {
+                        has_friendly = true
+                        break
+                    }
+                    if ((piece.color == 1 - this.color) && !piece.is_empty()) {
+                        has_enemy = true
+                    }
+                }
+
+                if (has_enemy && !has_friendly) {
+                    let jump_x = base_x + max * dir[0]
+                    let jump_y = base_y + max * dir[1]
+                    moves.push(9 * 1296 + jump_x * 36 + jump_y)
+                    jump_x += dir[0]
+                    jump_y += dir[1]
+                    while (true) {
+                        if (board.getPiece(jump_x, jump_y) == null) break
+                        moves.push(9 * 1296 + jump_x * 36 + jump_y)
+                        if (!board.getPiece(jump_x, jump_y).is_empty()) break
+                        jump_x += dir[0]
+                        jump_y += dir[1]
+                    }
+                }
+            }
+        }
 
         // return
 
-        moves = [...new Set(moves)].map((value) => [Math.floor(value / 36), value % 36])
+        moves = [...new Set(moves)]//.map((value) => [Math.floor(value / 1296), Math.floor(value / 36) % 36, value % 36])
         return moves
     }
 }
@@ -900,6 +977,16 @@ const PIECES = {
     ]),
     275: new Piece(275, "Peng Master", "鵬師", [99,99,5,5,99,5,5,99], [
         [3, 3, NONE], [3, -3, NONE]
+    ]),
+    276: new Piece(276, "Free Eagle", "奔鷲", Q, [
+        [2, 0, [99,0,0,0,0,0,0,0]], [3, 0, [99,0,0,0,0,0,0,0]],
+        [2, 2, [0,99,0,0,0,0,0,0]], [3, 3, [0,99,0,0,0,0,0,0]], [4, 4, [0,99,0,0,0,0,0,0]],
+        [0, 2, [0,0,99,0,0,0,0,0]], [0, 3, [0,0,99,0,0,0,0,0]],
+        [-2, 2, [0,0,0,99,0,0,0,0]], [-3, 3, [0,0,0,99,0,0,0,0]],
+        [-2, 0, [0,0,0,0,99,0,0,0]], [-3, 0, [0,0,0,0,99,0,0,0]],
+        [-2, -2, [0,0,0,0,0,99,0,0]], [-3, -3, [0,0,0,0,0,99,0,0]],
+        [0, -2, [0,0,0,0,0,0,99,0]], [0, -3, [0,0,0,0,0,0,99,0]],
+        [2, -2, [0,0,0,0,0,0,0,99]], [3, -3, [0,0,0,0,0,0,0,99]], [4, -4, [0,0,0,0,0,0,0,99]]
     ]),
 }
 
