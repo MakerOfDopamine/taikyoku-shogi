@@ -23,6 +23,7 @@ function render() {
     if (selected[0] != null) {
         let moves_able = board.board[selected[0]][selected[1]].get_legal_moves(board)
         for (let square of moves_able) {
+            if (square > 1296) continue
             document.getElementById(`cell-${Math.floor(square / 36) % 36}-${square % 36}`).style.background = "#888888"
         }
     }
@@ -32,12 +33,19 @@ function render_special() {
     clear()
     let moves_able = board.board[selected[0]][selected[1]].get_legal_moves(board)
     for (let i of moves_able) {
-        if (i >= 9 * 1296) {
-            console.log("hi")
+        if (i >= 10 * 1296) {
+            let j = [Math.floor((i - 10 * 1296) / 36) % 36, (i - 10 * 1296) % 36]
+            document.getElementById(`cell-${j[0]}-${j[1]}`).style.background = "#2a6a88"
+        } else if (i >= 9 * 1296) {
             let j = [Math.floor((i - 9 * 1296) / 36) % 36, (i - 9 * 1296) % 36]
             document.getElementById(`cell-${j[0]}-${j[1]}`).style.background = "#905c4c"
-        } else {
-            console.log(i)
+        } else if (i >= 1296) {
+            let j = [Math.floor(i / 1296), Math.floor(i / 36) % 36, i % 36]
+            let anti_dir = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
+            anti_dir = anti_dir[j[0]-1]
+            if (!out_of_bounds(j[1] + anti_dir[0]) && !out_of_bounds(j[2] + anti_dir[1])) {
+                document.getElementById(`cell-${j[1] + anti_dir[0]}-${j[2] + anti_dir[1]}`).style.background = "#16cc5c"
+            }
         }
     }
 }
@@ -94,6 +102,7 @@ window.addEventListener('keyup', (event) => {
     if (event.key === 'Shift') {
         SHIFT = false
         if (selected[0] != null) {
+            clear()
             render()
         }
     };
@@ -120,22 +129,27 @@ if (false) {//confirm('Do you want to random move')) {
             choose_y = Math.floor(Math.random() * 36)
         }
         all_moves = board.board[choose_x][choose_y].get_legal_moves(board)
-        let chosen_move = all_moves[Math.floor(Math.random() * all_moves.length)]
-        if (board.board[chosen_move[0]][chosen_move[1]].id == 1000 || board.board[chosen_move[0]][chosen_move[1]].id == 11000) {
-            alert(turn == 1 ? "Black won!" : "White won!")
-        }
-        try {
-            board.board[chosen_move[0]][chosen_move[1]] = board.board[choose_x][choose_y].copy(chosen_move[0], chosen_move[1])
-            board.board[choose_x][choose_y] = PIECES[0].copy(choose_x, choose_y)
-            //render()
-        } catch {
+        if (all_moves.length == 0) {
             ;
-        }
-        turn = 1 - turn
-        count += 1
-        //console.log(count)
-        if (count % 100 == 0) {
-            render()
+        } else {
+            let chosen_move = all_moves[Math.floor(Math.random() * all_moves.length)]
+            chosen_move = [Math.floor(chosen_move / 36) % 36, chosen_move % 36]
+            if (board.board[chosen_move[0]][chosen_move[1]].id == 1000 || board.board[chosen_move[0]][chosen_move[1]].id == 11000) {
+                alert(turn == 1 ? "Black won!" : "White won!")
+            }
+            try {
+                board.board[chosen_move[0]][chosen_move[1]] = board.board[choose_x][choose_y].copy(chosen_move[0], chosen_move[1])
+                board.board[choose_x][choose_y] = PIECES[0].copy(choose_x, choose_y)
+                //render()
+            } catch {
+                ;
+            }
+            turn = 1 - turn
+            count += 1
+            //console.log(count)
+            if (count % 100 == 0) {
+                render()
+            }
         }
     }, 1)
 }

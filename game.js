@@ -431,7 +431,18 @@ class Board {
             [273, 0, 24],
             [274, 6, 18],
             [275, 6, 17],
-            [276, 12, 18],
+            [276, 7, 18],
+            [283, 4, 16],
+            [283, 4, 19],
+            [286, 2, 5],
+            [286, 2, 30],
+            [287, 2, 4],
+            [287, 2, 31],
+            [288, 3, 15],
+            [288, 3, 20],
+            [290, 3, 18],
+            [291, 3, 17],
+            [292, 5, 19]
         ]
 
         for (let i of pieces_to_add) {
@@ -449,8 +460,9 @@ class Board {
         }
 
         this.board[0][17] = PIECES[1000].copy(0, 17)
-        this.board[35][18] = PIECES[11000].copy(35, 18)
+        this.board[35][18] = PIECES[1000].copy(35, 18)
         this.board[35][18].invert_color()
+        this.board[35][18].short_name = "<b>玉将</b>"
     }
 
     getPiece(x, y) {
@@ -471,6 +483,20 @@ class Piece {
         this.djump = djump
         this.color = color // 1 = BLACK, 0 = WHITE
         this.cache = [-1, -1, []]
+        if (this.id == 1000 || this.id == 39) {
+            this.level = 4
+        } else if (this.id == 291) {
+            this.level = 3
+        } else if (this.id == 290) {
+            this.level = 2
+        } else if (285 < this.id && 290 > this.id) {
+            this.level = 1
+        } else {this.level = 0}
+        // 4 = King / Crown Prince
+        // 3 = Great General
+        // 2 = Vice General
+        // 1 = All Range-capturing
+        // 0 = All Pieces
 
         this.x = x
         this.y = y
@@ -512,6 +538,7 @@ class Piece {
             working_x = base_x
             working_y = base_y
             offset = 1
+            let pieces_jumped = 0
 
             while (offset <= this.dydx[count]) {
                 working_x += dir[0]
@@ -521,12 +548,16 @@ class Piece {
                 }
                 if ((board.board[working_x][working_y].color === (1 - this.color)) && !board.board[working_x][working_y].is_empty()) {
                     moves.push(working_x * 36 + working_y)
+                    pieces_jumped += 1
+                }
+                if (board.board[working_x][working_y].is_friendly(this)) {
+                    pieces_jumped += 1
+                } else {
+                    moves.push(working_x * 36 + working_y)
+                }
+                if (pieces_jumped > this.djump[count]) {
                     break
                 }
-                if ((!board.board[working_x][working_y].is_empty()) || (board.board[working_x][working_y].is_friendly(this))) {
-                    break
-                }
-                moves.push(working_x * 36 + working_y)
                 offset += 1
             }
             count += 1
@@ -563,7 +594,7 @@ class Piece {
                             moves.push(working_x * 36 + working_y)
                             break
                         }
-                        if ((!board.board[working_x][working_y].is_empty()) || (board.board[working_x][working_y].is_friendly(this))) {
+                        if ((!board.board[working_x][working_y].is_empty()) || (this.is_friendly(board.board[working_x][working_y]))) {
                             break
                         }
                         moves.push(working_x * 36 + working_y)
@@ -576,9 +607,22 @@ class Piece {
 
         // special
         if (this.id === 276) {
+            let igui_count = 1
             for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
-                let max = (dir[0] === 1 && Math.abs(dir[1]) === 1) ? 4 : 3
+                let max = 0
+                if (this.color == 1) {max = (dir[0] === 1 && Math.abs(dir[1]) === 1) ? 4 : 3}
+                else {max = (dir[0] === -1 && Math.abs(dir[1]) === 1) ? 4 : 3}
                 
+                // IGUI handling
+                let adjacent_piece = board.getPiece(base_x + dir[0], base_y + dir[1])
+                if (adjacent_piece === null) {
+                    continue
+                } else {
+                    if (!this.is_friendly(adjacent_piece)) {
+                        moves.push(igui_count * 1296 + base_x * 36 + base_y)
+                    }
+                }
+
                 // Can we move that far?
                 if (board.getPiece(base_x + max * dir[0], base_y + max * dir[1]) === null) {
                     continue
@@ -605,11 +649,76 @@ class Piece {
                     jump_x += dir[0]
                     jump_y += dir[1]
                     while (true) {
-                        if (board.getPiece(jump_x, jump_y) == null) break
+                        if (board.getPiece(jump_x, jump_y) == null || this.is_friendly(board.getPiece(jump_x, jump_y))) break
                         moves.push(9 * 1296 + jump_x * 36 + jump_y)
                         if (!board.getPiece(jump_x, jump_y).is_empty()) break
                         jump_x += dir[0]
                         jump_y += dir[1]
+                    }
+                }
+                igui_count += 1
+            }
+        }
+
+        if ([286, 287, 288, 289, 290, 291].includes(this.id)) {
+            let trample_dir = []
+            switch (this.id) {
+                case 286:
+                case 289:
+                    trample_dir = [[1, 0], [0, 1], [-1, 0], [0, -1]]
+                    break
+                case 287:
+                case 288:
+                case 290:
+                    trample_dir = [[1, 1], [-1, 1], [-1, -1], [1, -1]]
+                    break
+                case 291:
+                    trample_dir = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
+                    break
+            }
+
+            for (let dir of trample_dir) {
+                let jump_x = base_x + dir[0]
+                let jump_y = base_y + dir[1]
+                while (!out_of_bounds(jump_x) && !out_of_bounds(jump_y)) {
+                    if (board.getPiece(jump_x, jump_y).level >= this.level) {
+                        break
+                    } 
+                    moves.push(10 * 1296 + jump_x * 36 + jump_y)
+                    jump_x += dir[0]
+                    jump_y += dir[1]
+                }
+            }
+        }
+
+        if (this.id === 292) {
+            let middle = []
+            for (let dir of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+                working_x = base_x + dir[0]
+                working_y = base_y + dir[1]
+                while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
+                    if (this.is_friendly(board.board[working_x][working_y])) break
+                    middle.push(working_x * 36 + working_y)
+                    if ((!board.board[working_x][working_y].is_empty())) {
+                        break
+                    }
+                    working_x += dir[0]
+                    working_y += dir[1]
+                }
+            }
+
+            for (let midpoint of middle) {
+                for (let dir of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+                    working_x = Math.floor(midpoint / 36) + dir[0]
+                    working_y = (midpoint % 36) + dir[1]
+                    while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
+                        if (this.is_friendly(board.board[working_x][working_y])) break
+                        moves.push(working_x * 36 + working_y)
+                        if ((!board.board[working_x][working_y].is_empty())) {
+                            break
+                        }
+                        working_x += dir[0]
+                        working_y += dir[1]
                     }
                 }
             }
@@ -626,7 +735,6 @@ const NONE = [0,0,0,0,0,0,0,0]
 const Q = [99,99,99,99,99,99,99,99]
 const PIECES = {
     1000: new Piece(1000, "King", "<b>王将</b>", [2,2,2,2,2,2,2,2]),
-    11000: new Piece(11000, "King", "<b>玉将</b>", [2,2,2,2,2,2,2,2]),
     0: new Piece(0, "Empty", ""),
     1: new Piece(1, "Pawn", "歩兵", [1,0,0,0,0,0,0,0]),
     2: new Piece(2, "Earth General", "土将", [1,0,0,0,1,0,0,0]),
@@ -988,5 +1096,39 @@ const PIECES = {
         [0, -2, [0,0,0,0,0,0,99,0]], [0, -3, [0,0,0,0,0,0,99,0]],
         [2, -2, [0,0,0,0,0,0,0,99]], [3, -3, [0,0,0,0,0,0,0,99]], [4, -4, [0,0,0,0,0,0,0,99]]
     ]),
+    277: new Piece(277, "Free Bird", "奔翅", [99,99,99,3,99,3,99,99], [], [0,3,0,0,0,0,0,3]), // PROMOTE
+    278: new Piece(278, "Great Hawk", "大鷹", Q, [ // PROMOTE
+        [2, 0, [99,0,0,0,0,0,0,0]]
+    ]),
+    279: new Piece(279, "King of Teachings", "教王", Q, [], [3,3,3,3,3,3,3,3]), // PROMOTE
+    280: new Piece(280, "Mountain Crane", "山鶻", Q, [ // PROMOTE
+        [2, 0, [99,0,0,0,0,0,0,0]], [3, 0, [99,0,0,0,0,0,0,0]],
+        [2, 2, [0,99,0,0,0,0,0,0]], [3, 3, [0,99,0,0,0,0,0,0]],
+        [0, 2, [0,0,99,0,0,0,0,0]], [0, 3, [0,0,99,0,0,0,0,0]],
+        [-2, 2, [0,0,0,99,0,0,0,0]], [-3, 3, [0,0,0,99,0,0,0,0]],
+        [-2, 0, [0,0,0,0,99,0,0,0]], [-3, 0, [0,0,0,0,99,0,0,0]],
+        [-2, -2, [0,0,0,0,0,99,0,0]], [-3, -3, [0,0,0,0,0,99,0,0]],
+        [0, -2, [0,0,0,0,0,0,99,0]], [0, -3, [0,0,0,0,0,0,99,0]],
+        [2, -2, [0,0,0,0,0,0,0,99]], [3, -3, [0,0,0,0,0,0,0,99]],
+    ]), 
+    281: new Piece(281, "Great Eagle", "大鷲", Q, [ // PROMOTE
+        [2, 2, [0,99,0,0,0,0,0,0]], [2, -2, [0,0,0,0,0,0,0,99]]
+    ]),
+    282: new Piece(282, "Great Elephant", "大象", [99,3,99,99,99,99,99,3], [], [3,0,3,3,3,3,3,0]), // PROMOTE
+    283: new Piece(283, "Gold Bird", "金翅", [99,99,3,3,99,3,3,99], [], [0,3,0,0,0,0,0,3]),
+    284: new Piece(284, "Ancient Dragon", "元龍", [99,99,0,99,99,99,0,99], [], [3,0,0,0,3,0,0,0]), // PROMOTE
+    285: new Piece(285, "Rain Demon", "霖鬼", [3,99,2,2,99,2,2,99], [ // PROMOTE
+        [2, 2, [0,99,0,0,0,0,0,0], [2, -2, [0,0,0,0,0,0,0,99]]]
+    ]),
+    286: new Piece(286, "Flying General", "飛将", [99,0,99,0,99,0,99,0]),
+    287: new Piece(287, "Angle General", "角将", [0,99,0,99,0,99,0,99]),
+    288: new Piece(288, "Fierce Dragon", "猛龍", [2,99,2,99,2,99,2,99]),
+    289: new Piece(289, "Flying Crocodile", "飛鰐", [99,3,99,2,99,2,99,3]), // PROMOTE
+    290: new Piece(290, "Vice General", "副将", [0,99,0,99,0,99,0,99], [
+        [2, 0, NONE], [0, 2, NONE],
+        [-2, 0, NONE], [0, -2, NONE]
+    ]),
+    291: new Piece(291, "Great General", "大将", Q),
+    292: new Piece(292, "Hook Mover", "鉤行", [99,0,99,0,99,0,99,0])
 }
 
