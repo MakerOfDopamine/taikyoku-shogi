@@ -442,7 +442,11 @@ class Board {
             [288, 3, 20],
             [290, 3, 18],
             [291, 3, 17],
-            [292, 5, 19]
+            [292, 5, 19],
+            [293, 0, 6],
+            [293, 0, 29],
+            [294, 5, 16],
+            [295, 12, 18]
         ]
 
         for (let i of pieces_to_add) {
@@ -577,6 +581,11 @@ class Piece {
                     continue
                 }
 
+                if (!board.board[dest_x][dest_y].is_empty()) {
+                    moves.push(dest_x * 36 + dest_y)
+                    continue
+                }
+
                 moves.push(dest_x * 36 + dest_y)
                 count = 0
                 for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
@@ -605,7 +614,7 @@ class Piece {
             }
         }
 
-        // special
+        // free eagle moment
         if (this.id === 276) {
             let igui_count = 1
             for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
@@ -660,6 +669,7 @@ class Piece {
             }
         }
 
+        // trampling pieces
         if ([286, 287, 288, 289, 290, 291].includes(this.id)) {
             let trample_dir = []
             switch (this.id) {
@@ -691,15 +701,28 @@ class Piece {
             }
         }
 
-        if (this.id === 292) {
+        // hook pieces
+        if ([292, 293, 294].includes(this.id)) {
+            let hook_dir = []
+            switch (this.id) {
+                case 292:
+                    hook_dir = [[1, 0], [0, 1], [-1, 0], [0, -1]]
+                    break
+                case 293:
+                case 294:
+                    hook_dir = [[1, 1], [-1, 1], [-1, -1], [1, -1]]
+                    break
+            }
             let middle = []
-            for (let dir of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+            for (let dir of hook_dir) {
                 working_x = base_x + dir[0]
                 working_y = base_y + dir[1]
                 while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
                     if (this.is_friendly(board.board[working_x][working_y])) break
                     middle.push(working_x * 36 + working_y)
                     if ((!board.board[working_x][working_y].is_empty())) {
+                        middle.pop()
+                        moves.push(working_x * 36 + working_y)
                         break
                     }
                     working_x += dir[0]
@@ -708,7 +731,62 @@ class Piece {
             }
 
             for (let midpoint of middle) {
-                for (let dir of [[1, 0], [0, 1], [-1, 0], [0, -1]]) {
+                for (let dir of hook_dir) {
+                    working_x = Math.floor(midpoint / 36) + dir[0]
+                    working_y = (midpoint % 36) + dir[1]
+                    while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
+                        if (this.is_friendly(board.board[working_x][working_y])) break
+                        moves.push(working_x * 36 + working_y)
+                        if ((!board.board[working_x][working_y].is_empty())) {
+                            break
+                        }
+                        working_x += dir[0]
+                        working_y += dir[1]
+                    }
+                }
+            }
+        }
+
+        // peacock (separate section because its logic is slightly different)
+        if (this.id === 295) {
+            let left = []
+            let right = []
+            let count = 0
+            for (let dir of (this.color === 0 ? [[-1, -1], [-1, 1]] : [[1, -1], [1, 1]])) {
+                working_x = base_x + dir[0]
+                working_y = base_y + dir[1]
+                while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
+                    if (this.is_friendly(board.board[working_x][working_y])) break
+                    ((count === 0) ? left : right).push(working_x * 36 + working_y)
+                    if ((!board.board[working_x][working_y].is_empty())) {
+                        ((count === 0) ? left : right).pop()
+                        moves.push(working_x * 36 + working_y)
+                        break
+                    }
+                    working_x += dir[0]
+                    working_y += dir[1]
+                }
+                count += 1
+            }
+            
+            for (let midpoint of (this.color === 0 ? right : left)) {
+                for (let dir of [[-1, -1], [1, 1]]) {
+                    working_x = Math.floor(midpoint / 36) + dir[0]
+                    working_y = (midpoint % 36) + dir[1]
+                    while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
+                        if (this.is_friendly(board.board[working_x][working_y])) break
+                        moves.push(working_x * 36 + working_y)
+                        if ((!board.board[working_x][working_y].is_empty())) {
+                            break
+                        }
+                        working_x += dir[0]
+                        working_y += dir[1]
+                    }
+                }
+            }
+
+            for (let midpoint of (this.color === 0 ? left : right)) {
+                for (let dir of [[1, -1], [-1, 1]]) {
                     working_x = Math.floor(midpoint / 36) + dir[0]
                     working_y = (midpoint % 36) + dir[1]
                     while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
@@ -1129,6 +1207,9 @@ const PIECES = {
         [-2, 0, NONE], [0, -2, NONE]
     ]),
     291: new Piece(291, "Great General", "大将", Q),
-    292: new Piece(292, "Hook Mover", "鉤行", [99,0,99,0,99,0,99,0])
+    292: new Piece(292, "Hook Mover", "鉤行", [99,0,99,0,99,0,99,0]),
+    293: new Piece(293, "Tengu", "天狗", [0,99,0,99,0,99,0,99]),
+    294: new Piece(294, "Capricorn", "摩羯", [1,99,1,99,1,99,1,99]),
+    295: new Piece(295, "Peacock", "孔雀", [0,99,0,2,0,2,0,99])
 }
 
