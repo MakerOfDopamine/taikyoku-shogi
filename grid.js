@@ -17,7 +17,7 @@ function render() {
     for (let i = 0; i < 36; i++) {
         for (let j = 0; j < 36; j++) {
             document.getElementById(`cell-${i}-${j}`).innerHTML = board.board[i][j].short_name
-            document.getElementById(`cell-${i}-${j}`).style.color = board.board[i][j].color == 0 ? "#ffffff" : "#000000" 
+            document.getElementById(`cell-${i}-${j}`).style.color = board.board[i][j].promoted ? (board.board[i][j].color == 0 ? "#00aaff" : "#ff0000") : (board.board[i][j].color == 0 ? "#ffffff" : "#000000")
         }
     }
     if (selected[0] != null) {
@@ -67,8 +67,9 @@ function click(x, y) {
     } else {
         let moves_able = board.board[selected[0]][selected[1]].get_legal_moves(board)
         if (moves_able.includes(1296 * (SHIFT ? 9 : 0) + 36 * x + y)) {
-            board.board[x][y] = board.board[selected[0]][selected[1]].copy(x, y)
-            board.board[selected[0]][selected[1]] = PIECES[0].copy(selected[0], selected[1])
+            board.move(selected[0], selected[1], 1296 * (SHIFT ? 9 : 0) + 36 * x + y)
+            //board.board[x][y] = board.board[selected[0]][selected[1]].copy(x, y)
+            //board.board[selected[0]][selected[1]] = PIECES[0].copy(selected[0], selected[1])
             selected = [null, null]
         } else {
             for (let square of moves_able) {

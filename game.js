@@ -446,10 +446,15 @@ class Board {
             [293, 0, 6],
             [293, 0, 29],
             [294, 5, 16],
-            [295, 12, 18]
+            [295, 2, 13],
+            [295, 2, 22],
+            [297, 3, 12],
+            [297, 3, 23],
+            [300, 7, 17]
         ]
 
         for (let i of pieces_to_add) {
+            if (this.board[i[1]][i[2]] != 0) {alert("Duplicate piece placement!")}
             this.board[i[1]][i[2]] = PIECES[i[0]].copy(i[1], i[2])
             this.board[reverse(i[1])][reverse(i[2])] = PIECES[i[0]].copy(reverse(i[1]), reverse(i[2]))
             this.board[reverse(i[1])][reverse(i[2])].invert_color()
@@ -475,10 +480,66 @@ class Board {
         }
         return this.board[x][y]
     }
+
+    move(start_x, start_y, move, no_promote = false) {
+        // DOES NOT VALIDATE THE MOVE OR WHETHER A MOVEMENT IS "IN BOUNDS"!
+        // Expects moves fed directly from the generator.
+        let special = Math.floor(move / 1296)
+        let target_x = Math.floor(move / 36) % 36
+        let target_y = move % 36
+        if (move < 1296) {
+            // Regular moves.
+            this.board[target_x][target_y] = this.board[start_x][start_y].copy(target_x, target_y)
+            this.board[start_x][start_y] = PIECES[0].copy(start_x, start_y)
+        } else if (move < 9 * 1296) {
+            // "Intermediate" moves: Move to an intermediate square first, then move to target square.
+            // Also handles igui-type moves.
+            let offset = ([[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]])[special - 1]
+            this.move(start_x, start_y, (start_x + offset[0]) * 36 + (start_y + offset[1]), true)
+            this.move(start_x + offset[0], start_y + offset[1], target_x * 36 + target_y, true)
+        } else if (move < 10 * 1296) {
+            // "Trample" moves: remove all intermediate pieces. Note that this can include friendly pieces!!
+            let dx = target_x - start_x
+            let dy = target_y - start_y
+
+            if ((dx === 0 || dy === 0 || Math.abs(dx) === Math.abs(dy)) && (dx !== 0 || dy !== 0)) {
+                let unit = [Math.sign(dx), Math.sign(dy)]
+                let size = Math.max(Math.abs(dx), Math.abs(dy))
+                this.board[target_x][target_y] = this.board[start_x][start_y].copy(target_x, target_y)
+                for (let i = 0; i < size; i++) {
+                    this.board[start_x + i * unit[0]][start_y + i * unit[1]] = PIECES[0].copy(start_x + i * unit[0], start_y + i * unit[1])
+                }
+            } else {
+                alert(`Invalid move... somehow ${move} ${start_x} ${start_y} ${target_x} ${target_y}`)
+            }
+
+        } else {
+            alert(`Invalid move: invalid special type [${move}]`)
+        }
+
+        if (!no_promote && ((this.board[target_x][target_y].color == 1 && target_x >= 25) || (this.board[target_x][target_y].color == 0 && target_x <= 10))) {
+            this.promote(target_x, target_y)
+        }
+    }
+
+    promote(x, y) {
+        if (this.board[x][y].promoted) {
+            return
+        }
+
+        if (PROMOTE[this.board[x][y].id] !== undefined) {
+            let color = this.board[x][y].color
+            this.board[x][y] = PIECES[PROMOTE[this.board[x][y].id]].copy(x, y)
+            if (color == 0) {
+                this.board[x][y].invert_color()
+            }
+            this.board[x][y].promoted = true
+        }
+    }
 }
 
 class Piece {
-    constructor(id, name, short_name = "", dydx = [0, 0, 0, 0, 0, 0, 0, 0], tp = [], djump = [0, 0, 0, 0, 0, 0, 0, 0], color = 1, x = 0, y = 0) {
+    constructor(id, name, short_name = "", dydx = [0, 0, 0, 0, 0, 0, 0, 0], tp = [], djump = [0, 0, 0, 0, 0, 0, 0, 0], color = 1, promoted = false, x = 0, y = 0) {
         this.id = id
         this.name = name
         this.short_name = short_name
@@ -486,12 +547,12 @@ class Piece {
         this.tp = tp
         this.djump = djump
         this.color = color // 1 = BLACK, 0 = WHITE
-        this.cache = [-1, -1, []]
-        if (this.id == 1000 || this.id == 39) {
+        this.promoted = promoted
+        if (this.id === 1000 || this.id === 39) {
             this.level = 4
-        } else if (this.id == 291) {
+        } else if (this.id === 291) {
             this.level = 3
-        } else if (this.id == 290) {
+        } else if (this.id === 290) {
             this.level = 2
         } else if (285 < this.id && 290 > this.id) {
             this.level = 1
@@ -507,7 +568,7 @@ class Piece {
     }
 
     copy(x, y) {
-        return new Piece(this.id, this.name, this.short_name, this.dydx, this.tp, this.djump, this.color, x, y)
+        return new Piece(this.id, this.name, this.short_name, this.dydx, this.tp, this.djump, this.color, this.promoted, x, y)
     }
 
     invert_color() {
@@ -550,11 +611,11 @@ class Piece {
                 if (out_of_bounds(working_x) || out_of_bounds(working_y)) {
                     break
                 }
-                if ((board.board[working_x][working_y].color === (1 - this.color)) && !board.board[working_x][working_y].is_empty()) {
+                if ((board.getPiece(working_x, working_y).color === (1 - this.color)) && !board.getPiece(working_x, working_y).is_empty()) {
                     moves.push(working_x * 36 + working_y)
                     pieces_jumped += 1
                 }
-                if (board.board[working_x][working_y].is_friendly(this)) {
+                if (board.getPiece(working_x, working_y).is_friendly(this)) {
                     pieces_jumped += 1
                 } else {
                     moves.push(working_x * 36 + working_y)
@@ -577,11 +638,11 @@ class Piece {
                     continue
                 }
 
-                if (board.board[dest_x][dest_y].is_friendly(this)) {
+                if (this.is_friendly(board.getPiece(dest_x, dest_y))) {
                     continue
                 }
 
-                if (!board.board[dest_x][dest_y].is_empty()) {
+                if (!board.getPiece(dest_x, dest_y).is_empty()) {
                     moves.push(dest_x * 36 + dest_y)
                     continue
                 }
@@ -599,11 +660,11 @@ class Piece {
                         if (out_of_bounds(working_x) || out_of_bounds(working_y)) {
                             break
                         }
-                        if ((board.board[working_x][working_y].color === (1 - this.color)) && !board.board[working_x][working_y].is_empty()) {
+                        if ((board.getPiece(working_x, working_y).color === (1 - this.color)) && !board.getPiece(working_x, working_y).is_empty()) {
                             moves.push(working_x * 36 + working_y)
                             break
                         }
-                        if ((!board.board[working_x][working_y].is_empty()) || (this.is_friendly(board.board[working_x][working_y]))) {
+                        if ((!board.getPiece(working_x, working_y).is_empty()) || (this.is_friendly(board.getPiece(working_x, working_y)))) {
                             break
                         }
                         moves.push(working_x * 36 + working_y)
@@ -619,7 +680,7 @@ class Piece {
             let igui_count = 1
             for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
                 let max = 0
-                if (this.color == 1) {max = (dir[0] === 1 && Math.abs(dir[1]) === 1) ? 4 : 3}
+                if (this.color === 1) {max = (dir[0] === 1 && Math.abs(dir[1]) === 1) ? 4 : 3}
                 else {max = (dir[0] === -1 && Math.abs(dir[1]) === 1) ? 4 : 3}
                 
                 // IGUI handling
@@ -646,7 +707,7 @@ class Piece {
                         has_friendly = true
                         break
                     }
-                    if ((piece.color == 1 - this.color) && !piece.is_empty()) {
+                    if ((piece.color === 1 - this.color) && !piece.is_empty()) {
                         has_enemy = true
                     }
                 }
@@ -658,7 +719,7 @@ class Piece {
                     jump_x += dir[0]
                     jump_y += dir[1]
                     while (true) {
-                        if (board.getPiece(jump_x, jump_y) == null || this.is_friendly(board.getPiece(jump_x, jump_y))) break
+                        if (board.getPiece(jump_x, jump_y) === null || this.is_friendly(board.getPiece(jump_x, jump_y))) break
                         moves.push(9 * 1296 + jump_x * 36 + jump_y)
                         if (!board.getPiece(jump_x, jump_y).is_empty()) break
                         jump_x += dir[0]
@@ -718,9 +779,9 @@ class Piece {
                 working_x = base_x + dir[0]
                 working_y = base_y + dir[1]
                 while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
-                    if (this.is_friendly(board.board[working_x][working_y])) break
+                    if (this.is_friendly(board.getPiece(working_x, working_y))) break
                     middle.push(working_x * 36 + working_y)
-                    if ((!board.board[working_x][working_y].is_empty())) {
+                    if ((!board.getPiece(working_x, working_y).is_empty())) {
                         middle.pop()
                         moves.push(working_x * 36 + working_y)
                         break
@@ -735,9 +796,9 @@ class Piece {
                     working_x = Math.floor(midpoint / 36) + dir[0]
                     working_y = (midpoint % 36) + dir[1]
                     while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
-                        if (this.is_friendly(board.board[working_x][working_y])) break
+                        if (this.is_friendly(board.getPiece(working_x, working_y))) break
                         moves.push(working_x * 36 + working_y)
-                        if ((!board.board[working_x][working_y].is_empty())) {
+                        if ((!board.getPiece(working_x, working_y).is_empty())) {
                             break
                         }
                         working_x += dir[0]
@@ -756,9 +817,9 @@ class Piece {
                 working_x = base_x + dir[0]
                 working_y = base_y + dir[1]
                 while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
-                    if (this.is_friendly(board.board[working_x][working_y])) break
+                    if (this.is_friendly(board.getPiece(working_x, working_y))) break
                     ((count === 0) ? left : right).push(working_x * 36 + working_y)
-                    if ((!board.board[working_x][working_y].is_empty())) {
+                    if ((!board.getPiece(working_x, working_y).is_empty())) {
                         ((count === 0) ? left : right).pop()
                         moves.push(working_x * 36 + working_y)
                         break
@@ -774,9 +835,9 @@ class Piece {
                     working_x = Math.floor(midpoint / 36) + dir[0]
                     working_y = (midpoint % 36) + dir[1]
                     while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
-                        if (this.is_friendly(board.board[working_x][working_y])) break
+                        if (this.is_friendly(board.getPiece(working_x, working_y))) break
                         moves.push(working_x * 36 + working_y)
-                        if ((!board.board[working_x][working_y].is_empty())) {
+                        if ((!board.getPiece(working_x, working_y).is_empty())) {
                             break
                         }
                         working_x += dir[0]
@@ -790,13 +851,35 @@ class Piece {
                     working_x = Math.floor(midpoint / 36) + dir[0]
                     working_y = (midpoint % 36) + dir[1]
                     while (!out_of_bounds(working_x) && !out_of_bounds(working_y)) {
-                        if (this.is_friendly(board.board[working_x][working_y])) break
+                        if (this.is_friendly(board.getPiece(working_x, working_y))) break
                         moves.push(working_x * 36 + working_y)
-                        if ((!board.board[working_x][working_y].is_empty())) {
+                        if ((!board.getPiece(working_x, working_y).is_empty())) {
                             break
                         }
                         working_x += dir[0]
                         working_y += dir[1]
+                    }
+                }
+            }
+        }
+
+        if (297 <= this.id && this.id <= 300) {
+            // Lion.
+            let first = []
+            let count = 0
+            for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
+                let piece = board.getPiece(base_x + dir[0], base_y + dir[1])
+                if (piece != null && !this.is_friendly(piece)) {
+                    first.push([count + 1, base_x + dir[0], base_y + dir[1]])
+                }
+                count += 1
+            }
+
+            for (let inter of first) {
+                for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
+                    let piece = board.getPiece(inter[1] + dir[0], inter[2] + dir[1])
+                    if (piece != null && !(this.is_friendly(piece) && (inter[1] + dir[0] != base_x || inter[2] + dir[1] != base_y))) {
+                        moves.push(inter[0] * 1296 + (inter[1] + dir[0]) * 36 + (inter[2] + dir[1]))
                     }
                 }
             }
@@ -869,7 +952,7 @@ const PIECES = {
     53: new Piece(53, "Northern Barbarian", "北狄", [1,1,2,0,1,0,2,1]),
     54: new Piece(54, "Southern Barbarian", "南蛮", [1,1,2,0,1,0,2,1]),
     55: new Piece(55, "Prancing Stag", "踊鹿", [1,1,2,0,1,0,2,1]),
-    56: new Piece(56, "Poisonous Snake", "毒蛇", [2,1,2,0,1,0,2,1]),
+    56: new Piece(56, "Poisonous Serpent", "毒蛇", [2,1,2,0,1,0,2,1]),
     57: new Piece(57, "Old Kite", "古鵄", [0,2,1,2,0,2,1,2]),
     58: new Piece(58, "Fierce Eagle", "猛鷲", [1,2,1,2,0,2,1,2]),
     59: new Piece(59, "Guardian of the Gods", "金剛", [3,0,3,0,3,0,3,0]),
@@ -1071,6 +1154,7 @@ const PIECES = {
     247: new Piece(247, "Great Shark", "大鱗", [99,5,99,2,99,2,99,5]), // PROMOTE
     248: new Piece(248, "Crossbow General", "弓将", [99,5,3,0,2,0,3,5]), // PROMOTE
     249: new Piece(249, "Playful Parrot", "遊䳇", [99,3,5,2,99,2,5,3]), // PROMOTE
+    // Jumping Pieces
     250: new Piece(250, "Cassia Horse", "桂馬", NONE, [
         [2, 1, NONE], [2, -1, NONE]
     ]),
@@ -1210,6 +1294,236 @@ const PIECES = {
     292: new Piece(292, "Hook Mover", "鉤行", [99,0,99,0,99,0,99,0]),
     293: new Piece(293, "Tengu", "天狗", [0,99,0,99,0,99,0,99]),
     294: new Piece(294, "Capricorn", "摩羯", [1,99,1,99,1,99,1,99]),
-    295: new Piece(295, "Peacock", "孔雀", [0,99,0,2,0,2,0,99])
+    295: new Piece(295, "Peacock", "孔雀", [0,99,0,2,0,2,0,99]),
+    296: new Piece(296, "Heavenly Tetrarch King", "天王", Q, [ // PROMOTE
+        [2, 0, [99,0,0,0,0,0,0,0]], [2, 2, [0,99,0,0,0,0,0,0]], 
+        [0, 2, [0,0,99,0,0,0,0,0]], [-2, 2, [0,0,0,99,0,0,0,0]], 
+        [-2, 0, [0,0,0,0,99,0,0,0]], [-2, -2, [0,0,0,0,0,99,0,0]], 
+        [0, -2, [0,0,0,0,0,0,99,0]], [2, -2, [0,0,0,0,0,0,0,99]]
+    ]),
+    297: new Piece(297, "Lion", "獅子", [1,1,1,1,1,1,1,1], [
+        [2, 0, NONE], [2, 1, NONE], [2, 2, NONE],
+        [1, 2, NONE], [0, 2, NONE], [-1, 2, NONE], [-2, 2, NONE],
+        [-2, 1, NONE], [-2, 0, NONE], [-2, -1, NONE], [-2, -2, NONE],
+        [-1, -2, NONE], [0, -2, NONE], [1, -2, NONE], [2, -2, NONE],
+        [2, -1, NONE]
+    ]),
+    298: new Piece(298, "Furious Fiend", "奮迅", [3,3,3,3,3,3,3,3], [
+        [2, 0, NONE], [2, 1, NONE], [2, 2, NONE],
+        [1, 2, NONE], [0, 2, NONE], [-1, 2, NONE], [-2, 2, NONE],
+        [-2, 1, NONE], [-2, 0, NONE], [-2, -1, NONE], [-2, -2, NONE],
+        [-1, -2, NONE], [0, -2, NONE], [1, -2, NONE], [2, -2, NONE],
+        [2, -1, NONE]
+    ]),
+    299: new Piece(299, "Buddhist Spirit", "法性", Q, [
+        [2, 0, NONE], [2, 1, NONE], [2, 2, NONE],
+        [1, 2, NONE], [0, 2, NONE], [-1, 2, NONE], [-2, 2, NONE],
+        [-2, 1, NONE], [-2, 0, NONE], [-2, -1, NONE], [-2, -2, NONE],
+        [-1, -2, NONE], [0, -2, NONE], [1, -2, NONE], [2, -2, NONE],
+        [2, -1, NONE]
+    ]),
+    300: new Piece(300, "Lion Hawk", "獅鷹", [0,99,0,99,0,99,0,99], [
+        [2, 0, NONE], [2, 1, NONE], [2, 2, NONE],
+        [1, 2, NONE], [0, 2, NONE], [-1, 2, NONE], [-2, 2, NONE],
+        [-2, 1, NONE], [-2, 0, NONE], [-2, -1, NONE], [-2, -2, NONE],
+        [-1, -2, NONE], [0, -2, NONE], [1, -2, NONE], [2, -2, NONE],
+        [2, -1, NONE]
+    ])
 }
 
+const PROMOTE = {
+    1: 25,
+    2: 48,
+    3: 31,
+    4: 48,
+    5: 48,
+    6: 91,
+    7: 227,
+    8: 90,
+    9: 161,
+    10: 48,
+    11: 71,
+    12: 139,
+    13: 140,
+    14: 21,
+    15: 220,
+    16: 98,
+    17: 121,
+    18: 164,
+    19: 41,
+    20: 135,
+    21: 33,
+    22: 21,
+    23: 103,
+    24: 88,
+    25: 92,
+    26: 40,
+    27: 100,
+    28: 145,
+    29: 145,
+    30: 165,
+    31: 39,
+    32: 222,
+    34: 279,
+    35: 299,
+    36: 145,
+    37: 157,
+    38: 158,
+    42: 48,
+    43: 189,
+    44: 189,
+    45: 113,
+    46: 73,
+    47: 190,
+    48: 190,
+    49: 243,
+    50: 155,
+    51: 297,
+    52: 268,
+    53: 273,
+    54: 283,
+    55: 95,
+    56: 292,
+    57: 293,
+    58: 266,
+    59: 74,
+    60: 74,
+    61: 72,
+    62: 215,
+    63: 214,
+    64: 170,
+    65: 171,
+    66: 291,
+    67: 290,
+    68: 242,
+    69: 74,
+    70: 74,
+    72: 234,
+    73: 233,
+    75: 194,
+    76: 213,
+    77: 216,
+    78: 258,
+    80: 223,
+    81: 248,
+    82: 232,
+    83: 89,
+    84: 143,
+    85: 152,
+    86: 99,
+    87: 246,
+    89: 192,
+    92: 163,
+    93: 109,
+    94: 162,
+    95: 110,
+    99: 107,
+    100: 164,
+    104: 169,
+    108: 280,
+    113: 291,
+    116: 126,
+    117: 125,
+    118: 164,
+    119: 231,
+    120: 79,
+    124: 235,
+    127: 204,
+    128: 92,
+    129: 173,
+    130: 174,
+    132: 106,
+    133: 97,
+    134: 180,
+    135: 104,
+    136: 104,
+    137: 101,
+    138: 104,
+    139: 165,
+    140: 96,
+    141: 208,
+    144: 87,
+    147: 142,
+    148: 159,
+    149: 165,
+    150: 123,
+    151: 122,
+    153: 184,
+    154: 148,
+    156: 108,
+    160: 101,
+    163: 266,
+    164: 265,
+    166: 111,
+    167: 220,
+    168: 220,
+    172: 112,
+    175: 112,
+    176: 105,
+    177: 89,
+    178: 99,
+    181: 183,
+    182: 147,
+    183: 186,
+    184: 185,
+    187: 114,
+    188: 221,
+    191: 109,
+    193: 241,
+    197: 296,
+    198: 245,
+    199: 269,
+    201: 270,
+    202: 105,
+    203: 197,
+    205: 168,
+    206: 228,
+    207: 179,
+    208: 199,
+    209: 249,
+    210: 131,
+    211: 102,
+    212: 200,
+    213: 195,
+    217: 188,
+    218: 146,
+    219: 237,
+    220: 284,
+    221: 222,
+    222: 224,
+    223: 273,
+    225: 160,
+    226: 247,
+    227: 115,
+    229: 255,
+    230: 196,
+    236: 240,
+    238: 261,
+    239: 263,
+    243: 113,
+    244: 113,
+    250: 208,
+    251: 163,
+    252: 283,
+    253: 283,
+    254: 92,
+    255: 243,
+    256: 265,
+    257: 272,
+    258: 114,
+    259: 266,
+    260: 266,
+    262: 271,
+    265: 278,
+    266: 281,
+    267: 268,
+    268: 282,
+    283: 277,
+    286: 289,
+    287: 285,
+    288: 220,
+    290: 291,
+    294: 292,
+    295: 293,
+    297: 298
+}
