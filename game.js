@@ -1,4 +1,4 @@
-const out_of_bounds = (n) => (0 > n) || (35 < n)
+const out_of_bounds = (n) => !Number.isInteger(n) || (0 > n) || (35 < n)
 const reverse = (n) => (35 - n)
 
 class Board {
@@ -42,7 +42,11 @@ class Board {
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         ]
         if (base_board != null) {
-            this.board = base_board
+            // Deep copy: never alias the caller's array. Coordinates are re-derived
+            // from the actual position so a hand-built board can't disagree with itself.
+            this.board = base_board.map((row, i) => row.map(
+                (piece, j) => (piece === 0 ? PIECES[0] : piece).copy(i, j)
+            ))
         } else {
             this.initiate()
         }
@@ -454,24 +458,29 @@ class Board {
         ]
 
         for (let i of pieces_to_add) {
-            if (this.board[i[1]][i[2]] != 0) {alert("Duplicate piece placement!")}
+            if (this.board[i[1]][i[2]] != 0 || this.board[reverse(i[1])][reverse(i[2])] != 0) {
+                alert(`Duplicate piece placement! [${i[0]} @ ${i[1]},${i[2]}]`)
+            }
             this.board[i[1]][i[2]] = PIECES[i[0]].copy(i[1], i[2])
             this.board[reverse(i[1])][reverse(i[2])] = PIECES[i[0]].copy(reverse(i[1]), reverse(i[2]))
             this.board[reverse(i[1])][reverse(i[2])].invert_color()
         }
 
-        for (let i = 0; i < 36; i++) {
-            for (let j = 0; j < 36; j++) {
-                if (this.board[i][j] === 0) {
-                    this.board[i][j] = PIECES[0].copy(i[1], i[2])
-                }
-            }
+        if (this.board[0][17] != 0 || this.board[35][18] != 0) {
+            alert("Duplicate piece placement! [king]")
         }
-
         this.board[0][17] = PIECES[1000].copy(0, 17)
         this.board[35][18] = PIECES[1000].copy(35, 18)
         this.board[35][18].invert_color()
         this.board[35][18].short_name = "<b>玉将</b>"
+
+        for (let i = 0; i < 36; i++) {
+            for (let j = 0; j < 36; j++) {
+                if (this.board[i][j] === 0) {
+                    this.board[i][j] = PIECES[0].copy(i, j)
+                }
+            }
+        }
     }
 
     getPiece(x, y) {
@@ -495,8 +504,16 @@ class Board {
             // "Intermediate" moves: Move to an intermediate square first, then move to target square.
             // Also handles igui-type moves.
             let offset = ([[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]])[special - 1]
-            this.move(start_x, start_y, (start_x + offset[0]) * 36 + (start_y + offset[1]), true)
-            this.move(start_x + offset[0], start_y + offset[1], target_x * 36 + target_y, true)
+            let mid_x = start_x + offset[0]
+            let mid_y = start_y + offset[1]
+            if (out_of_bounds(mid_x) || out_of_bounds(mid_y)) {
+                // x * 36 + y silently wraps into the neighbouring rank for an off-board
+                // square, and can wrap past 1296 and re-enter this branch forever.
+                alert(`Invalid move: intermediate square off board [${move}] ${mid_x},${mid_y}`)
+                return
+            }
+            this.move(start_x, start_y, mid_x * 36 + mid_y, true)
+            this.move(mid_x, mid_y, target_x * 36 + target_y, true)
         } else if (move < 10 * 1296) {
             // "Trample" moves: remove all intermediate pieces. Note that this can include friendly pieces!!
             let dx = target_x - start_x
@@ -511,10 +528,11 @@ class Board {
                 }
             } else {
                 alert(`Invalid move... somehow ${move} ${start_x} ${start_y} ${target_x} ${target_y}`)
+                return
             }
-
         } else {
             alert(`Invalid move: invalid special type [${move}]`)
+            return
         }
 
         if (!no_promote && ((this.board[target_x][target_y].color == 1 && target_x >= 25) || (this.board[target_x][target_y].color == 0 && target_x <= 10))) {
@@ -568,7 +586,15 @@ class Piece {
     }
 
     copy(x, y) {
-        return new Piece(this.id, this.name, this.short_name, this.dydx, this.tp, this.djump, this.color, this.promoted, x, y)
+        // dydx / tp / djump are cloned so an instance can never mutate the PIECES template
+        // (and thus every other piece of the same type) in place.
+        return new Piece(
+            this.id, this.name, this.short_name,
+            this.dydx.slice(),
+            this.tp.map((entry) => { let e = entry.slice(); e[2] = entry[2].slice(); return e }),
+            this.djump.slice(),
+            this.color, this.promoted, x, y
+        )
     }
 
     invert_color() {
@@ -677,8 +703,9 @@ class Piece {
 
         // free eagle moment
         if (this.id === 276) {
-            let igui_count = 1
+            let igui_count = 0
             for (let dir of [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]) {
+                igui_count += 1
                 let max = 0
                 if (this.color === 1) {max = (dir[0] === 1 && Math.abs(dir[1]) === 1) ? 4 : 3}
                 else {max = (dir[0] === -1 && Math.abs(dir[1]) === 1) ? 4 : 3}
@@ -726,7 +753,6 @@ class Piece {
                         jump_y += dir[1]
                     }
                 }
-                igui_count += 1
             }
         }
 
@@ -754,8 +780,12 @@ class Piece {
                 while (!out_of_bounds(jump_x) && !out_of_bounds(jump_y)) {
                     if (board.getPiece(jump_x, jump_y).level >= this.level) {
                         break
-                    } 
-                    moves.push(10 * 1296 + jump_x * 36 + jump_y)
+                    }
+                    // Friendly pieces in the path are still removed by Board.move, but the
+                    // trample may not *end* on one.
+                    if (!this.is_friendly(board.getPiece(jump_x, jump_y))) {
+                        moves.push(9 * 1296 + jump_x * 36 + jump_y)
+                    }
                     jump_x += dir[0]
                     jump_y += dir[1]
                 }
@@ -1280,7 +1310,7 @@ const PIECES = {
     283: new Piece(283, "Gold Bird", "金翅", [99,99,3,3,99,3,3,99], [], [0,3,0,0,0,0,0,3]),
     284: new Piece(284, "Ancient Dragon", "元龍", [99,99,0,99,99,99,0,99], [], [3,0,0,0,3,0,0,0]), // PROMOTE
     285: new Piece(285, "Rain Demon", "霖鬼", [3,99,2,2,99,2,2,99], [ // PROMOTE
-        [2, 2, [0,99,0,0,0,0,0,0], [2, -2, [0,0,0,0,0,0,0,99]]]
+        [2, 2, [0,99,0,0,0,0,0,0]], [2, -2, [0,0,0,0,0,0,0,99]]
     ]),
     286: new Piece(286, "Flying General", "飛将", [99,0,99,0,99,0,99,0]),
     287: new Piece(287, "Angle General", "角将", [0,99,0,99,0,99,0,99]),
