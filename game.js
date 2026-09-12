@@ -1,5 +1,11 @@
 const out_of_bounds = (n) => !Number.isInteger(n) || (0 > n) || (35 < n)
 const reverse = (n) => (35 - n)
+const RESULT_ROYAL_CAPTURE = "royal_capture"
+const RESULT_STALEMATE = "stalemate"
+const RESULT_REPETITION = "repetition"
+const RESULT_NO_PROGRESS = "no_progress"
+const NONE = [0,0,0,0,0,0,0,0]
+const Q = [99,99,99,99,99,99,99,99]
 
 class Board {
     constructor(base_board = null) {
@@ -527,12 +533,14 @@ class Board {
                     this.board[start_x + i * unit[0]][start_y + i * unit[1]] = PIECES[0].copy(start_x + i * unit[0], start_y + i * unit[1])
                 }
             } else {
-                alert(`Invalid move... somehow ${move} ${start_x} ${start_y} ${target_x} ${target_y}`)
-                return
+                throw "Invalid move"
+                //alert(`Invalid move... somehow ${move} ${start_x} ${start_y} ${target_x} ${target_y}`)
+                //return
             }
         } else {
-            alert(`Invalid move: invalid special type [${move}]`)
-            return
+            throw "Invalid move (invalid special type)"
+            //alert(`Invalid move: invalid special type [${move}]`)
+            //return
         }
 
         if (!no_promote && ((this.board[target_x][target_y].color == 1 && target_x >= 25) || (this.board[target_x][target_y].color == 0 && target_x <= 10))) {
@@ -922,8 +930,284 @@ class Piece {
     }
 }
 
-const NONE = [0,0,0,0,0,0,0,0]
-const Q = [99,99,99,99,99,99,99,99]
+class Game {
+    // stalemate_loses: side to move with no legal move loses (true) or draws (false).
+    // repetition_limit: identical position + side to move this many times is a draw.
+    // no_progress_limit: plies without a capture or promotion before a draw. 0 to disable.
+    constructor(board = null, options = {}) {
+        this.board = (board != null) ? board : new Board()
+        this.turn = 1
+        this.ply_count = 0
+        this.is_over = false
+        this.winner = null
+        this.result = null
+        this.history = []
+
+        this.stalemate_loses = (options.stalemate_loses !== undefined) ? options.stalemate_loses : true
+        this.repetition_limit = (options.repetition_limit !== undefined) ? options.repetition_limit : 4
+        this.no_progress_limit = (options.no_progress_limit !== undefined) ? options.no_progress_limit : 0
+
+        this.no_progress_plies = 0
+        this.position_counts = new Map()
+        this.position_counts.set(this.position_key(), 1)
+    }
+
+    snapshot() {
+        return this.board.board.map((row) => row.map((piece) => piece.copy(piece.x, piece.y)))
+    }
+
+    position_key() {
+        let parts = []
+        for (let i = 0; i < 36; i++) {
+            for (let j = 0; j < 36; j++) {
+                let piece = this.board.board[i][j]
+                parts.push(piece.id === 0 ? "" : `${piece.id}${piece.color}${piece.promoted ? "p" : ""}`)
+            }
+        }
+        return parts.join(",") + "|" + this.turn
+    }
+
+    count_royals(color) {
+        let total = 0
+        for (let i = 0; i < 36; i++) {
+            for (let j = 0; j < 36; j++) {
+                let piece = this.board.board[i][j]
+                if (piece.id == 1000 && piece.color === color) {
+                    total += 1
+                }
+            }
+        }
+        return total
+    }
+
+    royal_squares(color) {
+        let squares = []
+        for (let i = 0; i < 36; i++) {
+            for (let j = 0; j < 36; j++) {
+                let piece = this.board.board[i][j]
+                if (piece.id == 1000 && piece.color === color) {
+                    squares.push([i, j])
+                }
+            }
+        }
+        return squares
+    }
+
+    // For UI warning and for engine evaluation.
+    is_royal_capturable(color) {
+        let royals = this.royal_squares(color)
+        if (royals.length === 0) return false
+        for (let move of this.all_legal_moves(1 - color)) {
+            for (let square of this.squares_emptied(move[0], move[1], move[2])) {
+                for (let royal of royals) {
+                    if (square[0] === royal[0] && square[1] === royal[1]) return true
+                }
+            }
+        }
+        return false
+    }
+
+    // ---- move generation --------------------------------------------------
+
+    get_legal_moves(x, y) {
+        if (this.is_over) return []
+        if (out_of_bounds(x) || out_of_bounds(y)) return []
+        let piece = this.board.getPiece(x, y)
+        if (piece.is_empty() || piece.color !== this.turn) return []
+        return piece.get_legal_moves(this.board)
+    }
+
+    // [[x, y, move_code], ...] for every piece of "color".
+    all_legal_moves(color = this.turn) {
+        let all = []
+        for (let i = 0; i < 36; i++) {
+            for (let j = 0; j < 36; j++) {
+                let piece = this.board.board[i][j]
+                if (piece.is_empty() || piece.color !== color) continue
+                for (let move of piece.get_legal_moves(this.board)) {
+                    all.push([i, j, move])
+                }
+            }
+        }
+        return all
+    }
+
+    has_legal_move(color = this.turn) {
+        for (let i = 0; i < 36; i++) {
+            for (let j = 0; j < 36; j++) {
+                let piece = this.board.board[i][j]
+                if (piece.is_empty() || piece.color !== color) continue
+                if (piece.get_legal_moves(this.board).length > 0) return true
+            }
+        }
+        return false
+    }
+
+    // Which squares a move would vacate. Covers intermediate captures (special 1-8) and everything swept by a trample (special 9) as well as the final square.
+    squares_emptied(x, y, move) {
+        let special = Math.floor(move / 1296)
+        let target_x = Math.floor(move / 36) % 36
+        let target_y = move % 36
+        let squares = [[target_x, target_y]]
+        if (special >= 1 && special <= 8) {
+            let offset = ([[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]])[special - 1]
+            let mid_x = x + offset[0]
+            let mid_y = y + offset[1]
+            if (!out_of_bounds(mid_x) && !out_of_bounds(mid_y)) squares.push([mid_x, mid_y])
+        } else if (special === 9) {
+            let unit = [Math.sign(target_x - x), Math.sign(target_y - y)]
+            let size = Math.max(Math.abs(target_x - x), Math.abs(target_y - y))
+            for (let i = 1; i < size; i++) squares.push([x + i * unit[0], y + i * unit[1]])
+        }
+        return squares
+    }
+
+    move(x, y, move_code) {
+        if (this.is_over) return false
+        if (out_of_bounds(x) || out_of_bounds(y)) return false
+
+        let piece = this.board.getPiece(x, y)
+        if (piece.is_empty()) return false
+        if (piece.color !== this.turn) return false
+
+        if (!piece.get_legal_moves(this.board).includes(move_code)) return false
+
+        let before = this.snapshot()
+        let royals_before = [this.count_royals(0), this.count_royals(1)]
+        let was_promoted = piece.promoted
+        let mover = this.turn
+
+        try {
+            this.board.move(x, y, move_code)
+        } catch (error) {
+            this.board.board = before
+            console.log(error)
+            return false
+        }
+
+        let royals_after = [this.count_royals(0), this.count_royals(1)]
+        let captured = this.count_pieces(before) - this.count_pieces(this.board.board)
+        let promoted_now = this.board.getPiece(
+            Math.floor(move_code / 36) % 36, move_code % 36
+        ).promoted && !was_promoted
+
+        this.history.push({
+            code: 12960 * (x * 36 + y + (was_promoted ? 1 : 0) * 1296) + move_code,
+            from: [x, y],
+            move: move_code,
+            turn: mover,
+            before: before,
+            no_progress_plies: this.no_progress_plies,
+            position_key: this.position_key()
+        })
+
+        this.turn = 1 - this.turn
+        this.ply_count += 1
+        this.no_progress_plies = (captured > 0 || promoted_now) ? 0 : this.no_progress_plies + 1
+
+        if (royals_after[1 - mover] < royals_before[1 - mover]) {
+            this.finish(mover, RESULT_ROYAL_CAPTURE)
+            return true
+        }
+        if (royals_after[mover] < royals_before[mover]) {
+            this.finish(1 - mover, RESULT_ROYAL_CAPTURE)
+            return true
+        }
+
+        let key = this.position_key()
+        let seen = (this.position_counts.get(key) || 0) + 1
+        this.position_counts.set(key, seen)
+        if (this.repetition_limit > 0 && seen >= this.repetition_limit) {
+            this.finish(null, RESULT_REPETITION)
+            return true
+        }
+        if (this.no_progress_limit > 0 && this.no_progress_plies >= this.no_progress_limit) {
+            this.finish(null, RESULT_NO_PROGRESS)
+            return true
+        }
+        if (!this.has_legal_move(this.turn)) {
+            this.finish(this.stalemate_loses ? mover : null, RESULT_STALEMATE)
+        }
+        return true
+    }
+
+    count_pieces(grid) {
+        let total = 0
+        for (let i = 0; i < 36; i++) {
+            for (let j = 0; j < 36; j++) if (grid[i][j].id !== 0) total += 1
+        }
+        return total
+    }
+
+    finish(winner, result) {
+        this.is_over = true
+        this.winner = winner
+        this.result = result
+    }
+
+    undo() {
+        if (this.history.length === 0) return false
+        let record = this.history.pop()
+
+        let key = this.position_key()
+        let seen = this.position_counts.get(key)
+        if (seen !== undefined) {
+            if (seen <= 1) this.position_counts.delete(key)
+            else this.position_counts.set(key, seen - 1)
+        }
+
+        this.board.board = record.before
+        this.turn = record.turn
+        this.ply_count -= 1
+        this.no_progress_plies = record.no_progress_plies
+        this.is_over = false
+        this.winner = null
+        this.result = null
+        return true
+    }
+
+    // ---- results ----------------------------------------------------------
+
+    is_game_over() {
+        return this.is_over
+    }
+
+    get_winner() {
+        return this.winner  // 1 = Black, 0 = White, null = draw or unfinished
+    }
+
+    result_string() {
+        if (!this.is_over) return "in progress"
+        if (this.winner === null) return `draw (${this.result})`
+        return `${this.winner === 1 ? "Black" : "White"} wins (${this.result})`
+    }
+
+    clone() {
+        let copy = new Game(new Board(this.board.board), {
+            stalemate_loses: this.stalemate_loses,
+            repetition_limit: this.repetition_limit,
+            no_progress_limit: this.no_progress_limit
+        })
+        copy.turn = this.turn
+        copy.ply_count = this.ply_count
+        copy.is_over = this.is_over
+        copy.winner = this.winner
+        copy.result = this.result
+        copy.no_progress_plies = this.no_progress_plies
+        copy.position_counts = new Map(this.position_counts)
+        return copy
+    }
+
+    move_to_string(x, y, move_code) {
+        let special = Math.floor(move_code / 1296)
+        let target_x = Math.floor(move_code / 36) % 36
+        let target_y = move_code % 36
+        let name = this.board.getPiece(x, y).name
+        let kind = special === 0 ? "" : (special === 9 ? " (trample)" : " (via intermediate)")
+        return `${name} ${x},${y} -> ${target_x},${target_y}${kind}`
+    }
+}
+
 const PIECES = {
     1000: new Piece(1000, "King", "<b>王将</b>", [2,2,2,2,2,2,2,2]),
     0: new Piece(0, "Empty", ""),
@@ -1557,3 +1841,510 @@ const PROMOTE = {
     295: 293,
     297: 298
 }
+
+// BELOW IS IRRELEVANT FOR ONLY THE BOARD VIEWER!
+
+// Material value of each piece, Pawn = 1. AUTOGENERATED!
+const VALUES = {
+    0: 0,         // Empty
+    1: 1,         // Pawn
+    2: 1.59,      // Earth General
+    3: 1.39,      // Go-Between
+    4: 1.6,       // Stone General
+    5: 1.92,      // Iron General
+    6: 2.28,      // Dog
+    7: 2.04,      // Swooping Owl
+    8: 2.25,      // Old Rat
+    9: 2.12,      // Strutting Crow
+    10: 1.94,     // Tile General
+    11: 1.74,     // Sword Soldier
+    12: 2.1,      // Copper General
+    13: 2.13,     // Flying Goose
+    14: 1.93,     // Climbing Monkey
+    15: 2.56,     // Reclining Dragon
+    16: 2.39,     // Coiled Serpent
+    17: 2.07,     // Flying Chicken
+    18: 2.57,     // Cat Sword
+    19: 2.34,     // Evil Wolf
+    20: 2.43,     // Silver General
+    21: 2.33,     // Fierce Stag
+    22: 2.22,     // Blind Dog
+    23: 2.94,     // Huai Chicken
+    24: 2.81,     // Old Monkey
+    25: 3.06,     // Gold General
+    26: 2.62,     // Fierce Wolf
+    27: 2.79,     // Fierce Leopard
+    28: 2.81,     // Blind Monkey
+    29: 2.82,     // Blind Bear
+    30: 3.17,     // Angry Boar
+    31: 2.91,     // Drunken Elephant
+    32: 3.61,     // Neighboring King
+    33: 2.82,     // Rushing Boar
+    34: 5.18,     // Deva
+    35: 4.88,     // Dark Spirit
+    36: 3.07,     // Blind Tiger
+    37: 2.61,     // Left General
+    38: 2.61,     // Right General
+    39: 3.52,     // Crown Prince
+    40: 3.05,     // Bear's Eyes
+    41: 3.08,     // Poisonous Wolf
+    42: 1.93,     // Wood General
+    43: 3.3,      // Donkey
+    44: 3.27,     // Enchanted Badger
+    45: 3.58,     // Flying Horse
+    46: 4.06,     // Beast Cadet
+    47: 4.74,     // Fragrant Elephant
+    48: 4.81,     // White Elephant
+    49: 3.91,     // Rushing Bird
+    50: 2.96,     // Fierce Bear
+    51: 4,        // Eastern Barbarian
+    52: 4.14,     // Western Barbarian
+    53: 3.57,     // Northern Barbarian
+    54: 4.17,     // Southern Barbarian
+    55: 3.32,     // Prancing Stag
+    56: 6,        // Poisonous Serpent
+    57: 5.88,     // Old Kite
+    58: 4.65,     // Fierce Eagle
+    59: 3.5,      // Guardian of the Gods
+    60: 3.37,     // Sumo Wrestler
+    61: 4.76,     // Fowl Cadet
+    62: 3.21,     // Horse General
+    63: 3.22,     // Ox General
+    64: 3.28,     // Wind General
+    65: 3.26,     // River General
+    66: 4.74,     // Fire General
+    67: 4.98,     // Water General
+    68: 3.39,     // Mountain General
+    69: 3.37,     // Buddhist Devil
+    70: 3.15,     // Nature Spirit
+    71: 3.05,     // Sword General
+    72: 5.27,     // Fowl Officer
+    73: 5.3,      // Beast Officer
+    74: 5.89,     // Heavenly Tetrarch
+    75: 3.15,     // Chicken General
+    76: 3.11,     // Pup General
+    77: 3.65,     // Pig General
+    78: 4.51,     // Mountain Stag
+    79: 6.62,     // Leopard King
+    80: 4.16,     // Turtle Dove
+    81: 4.32,     // Crossbow Soldier
+    82: 4.95,     // Cannon Soldier
+    83: 3.07,     // Incense Chariot
+    84: 2.47,     // Ox Chariot
+    85: 2.55,     // Fierce Tiger
+    86: 3.38,     // Reverse Chariot
+    87: 5.77,     // Side Dragon
+    88: 6.62,     // Mountain Witch
+    89: 7.01,     // White Foal
+    90: 6.81,     // Mockingbird
+    91: 6.88,     // Multi General
+    92: 6.84,     // Flying Chariot
+    93: 7.02,     // Soldier
+    94: 6.75,     // Running Chariot
+    95: 7.04,     // Square Mover
+    96: 6.51,     // Gliding Swallow
+    97: 5.79,     // Free Serpent
+    98: 5.8,      // Coiled Dragon
+    99: 6.37,     // Whale
+    100: 5.25,    // Angle Mover
+    101: 6.64,    // Free Wolf
+    102: 6.58,    // Running Leopard
+    103: 7.35,    // Wizard Stork
+    104: 8.27,    // Flying Ox
+    105: 8.07,    // Free Bear
+    106: 8.16,    // Free Leopard
+    107: 8.21,    // Great Whale
+    108: 11.71,   // Treacherous Fox
+    109: 8.75,    // Cavalier
+    110: 8.78,    // Strong Chariot
+    111: 8.67,    // Free Dragon
+    112: 8.54,    // Free Tiger
+    113: 20.01,   // Free King
+    114: 9.87,    // Free Stag
+    115: 9.89,    // Strong Eagle
+    116: 2.57,    // Howling Dog (left)
+    117: 2.56,    // Howling Dog (right)
+    118: 3.91,    // Vertical Horse
+    119: 3.24,    // Spear Soldier
+    120: 3.82,    // Vertical Pup
+    121: 3.27,    // Raiding Hawk
+    122: 4.09,    // Right Iron Chariot
+    123: 4.14,    // Left Iron Chariot
+    124: 3.79,    // Vertical Leopard
+    125: 3.54,    // Right Dog
+    126: 3.57,    // Left Dog
+    127: 3.66,    // Ram's-head Soldier
+    128: 4.18,    // Flying Swallow
+    129: 3.76,    // Wood Chariot
+    130: 3.74,    // Tile Chariot
+    131: 3.66,    // Running Boar
+    132: 4.64,    // Running Pup
+    133: 4.08,    // Running Serpent
+    134: 3.91,    // Earth Chariot
+    135: 4.61,    // Vertical Mover
+    136: 4.78,    // Fierce Ox
+    137: 3.91,    // Side Wolf
+    138: 4.11,    // Side Ox
+    139: 3.98,    // Side Mover
+    140: 3.85,    // Swallow's Wings
+    141: 3.74,    // Side Monkey
+    142: 5.53,    // Divine Sparrow
+    143: 4.17,    // Plodding Ox
+    144: 4.1,     // Side Flyer
+    145: 4.63,    // Flying Stag
+    146: 4.66,    // Copper Elephant
+    147: 4.86,    // Vermillion Sparrow
+    148: 4.79,    // Turtle Snake
+    149: 4.87,    // Side Boar
+    150: 4.74,    // Left Chariot
+    151: 4.76,    // Right Chariot
+    152: 4.49,    // Great Tiger
+    153: 4.75,    // Right Tiger
+    154: 4.55,    // Left Tiger
+    155: 5.41,    // Great Bear
+    156: 6.86,    // Running Rabbit
+    157: 5.4,     // Left Army
+    158: 5.5,     // Right Army
+    159: 5.59,    // Divine Turtle
+    160: 5.97,    // Running Wolf
+    161: 5.93,    // Flying Hawk
+    162: 7.53,    // Cannon Chariot
+    163: 8.36,    // Dragon King
+    164: 7.74,    // Dragon Horse
+    165: 7.21,    // Free Boar
+    166: 7.84,    // Wind Dragon
+    167: 7.58,    // Cloud Dragon
+    168: 6.36,    // Rain Dragon
+    169: 8.81,    // Fire Ox
+    170: 8.8,     // Fierce Wind
+    171: 8.63,    // Huai River
+    172: 3.73,    // Vertical Tiger
+    173: 4.21,    // Wind Snapping Turtle
+    174: 4.19,    // Running Tile
+    175: 5.14,    // Running Tiger
+    176: 5.08,    // Running Bear
+    177: 4.58,    // Gold Stag
+    178: 3.61,    // Silver Rabbit
+    179: 5.02,    // Walking Heron
+    180: 4.97,    // Reed Bird
+    181: 4.72,    // Right Dragon
+    182: 4.51,    // Left Dragon
+    183: 6.01,    // Blue Dragon
+    184: 5.86,    // White Tiger
+    185: 6.55,    // Divine Tiger
+    186: 6.43,    // Divine Dragon
+    187: 7.07,    // Running Stag
+    188: 8.31,    // Rear Standard
+    189: 7.42,    // Ceramic Dove
+    190: 7.49,    // Elephant King
+    191: 7.96,    // Horseman
+    192: 7.74,    // Great Foal
+    193: 8.53,    // Woodland Demon
+    194: 8.47,    // Free Chicken
+    195: 8.5,     // Free Dog
+    196: 7.59,    // Running Ox
+    197: 9.73,    // Chariot Soldier
+    198: 8.85,    // Fire Demon
+    199: 9.17,    // Water Ox
+    200: 9.71,    // Strong Bear
+    201: 3.18,    // Wind Horse
+    202: 4.47,    // Vertical Bear
+    203: 4.7,     // Vertical Soldier
+    204: 3.94,    // Tiger Soldier
+    205: 4.31,    // Earth Dragon
+    206: 4.99,    // Silver Chariot
+    207: 4.87,    // Stone Chariot
+    208: 4.54,    // Side Soldier
+    209: 5.71,    // Gold Chariot
+    210: 5.68,    // Boar Soldier
+    211: 5.97,    // Leopard Soldier
+    212: 6.72,    // Bear Soldier
+    213: 8.33,    // Free Pup
+    214: 8.39,    // Free Ox
+    215: 8.35,    // Free Horse
+    216: 8.39,    // Free Pig
+    217: 8.12,    // Little Standard
+    218: 4.69,    // Copper Chariot
+    219: 6.87,    // Forest Demon
+    220: 7.87,    // Great Dragon
+    221: 8.49,    // Center Standard
+    222: 8.81,    // Front Standard
+    223: 7.99,    // Great Dove
+    224: 9.52,    // Great Standard
+    225: 3.8,     // Vertical Wolf
+    226: 4.76,    // Side Serpent
+    227: 6.32,    // Cloud Eagle
+    228: 5.7,     // Goose Wing
+    229: 6,       // Horse Soldier
+    230: 6.44,    // Ox Soldier
+    231: 3.92,    // Spear General
+    232: 6.31,    // Cannon General
+    233: 8.79,    // Beast Bird
+    234: 8.81,    // Fowl
+    235: 4.52,    // Great Leopard
+    236: 5.61,    // Longbow Soldier
+    237: 6.74,    // Thunder Runner
+    238: 8.78,    // Fire Dragon
+    239: 8.64,    // Water Dragon
+    240: 8.07,    // Longbow General
+    241: 7.08,    // Stone Peng
+    242: 7.76,    // Mount Tai
+    243: 9.31,    // Free Demon
+    244: 9.4,     // Free Dream-Eater
+    245: 9.17,    // Free Fire
+    246: 9.73,    // Running Dragon
+    247: 8.69,    // Great Shark
+    248: 5.31,    // Crossbow General
+    249: 6.97,    // Playful Parrot
+    250: 1.57,    // Cassia Horse
+    251: 2.69,    // Flying Dragon
+    252: 4.52,    // Kirin
+    253: 4.77,    // Phoenix
+    254: 3.86,    // Flying Cat
+    255: 6.57,    // Running Horse
+    256: 9.83,    // Mountain Hawk
+    257: 9.66,    // Little Turtle
+    258: 8.38,    // Great Stag
+    259: 9.98,    // Left Mountain Eagle
+    260: 10.18,   // Right Mountain Eagle
+    261: 9.54,    // Kirin Master
+    262: 9.85,    // Great Turtle
+    263: 9.58,    // Phoenix Master
+    264: 9.83,    // Great Master
+    265: 10.21,   // Horned Hawk
+    266: 10.43,   // Flying Eagle
+    267: 11,      // Roaring Dog
+    268: 12.59,   // Lion Dog
+    269: 10.36,   // Great Dream-Eater
+    270: 3.32,    // Heavenly Horse
+    271: 10.77,   // Spirit Turtle
+    272: 10.51,   // Treasure Turtle
+    273: 8.54,    // Wooden Dove
+    274: 9.49,    // Center Master
+    275: 9.45,    // Peng Master
+    276: 23.36,   // Free Eagle
+    277: 13.66,   // Free Bird
+    278: 10.32,   // Great Hawk
+    279: 20.26,   // King of Teachings
+    280: 13.79,   // Mountain Crane
+    281: 10.56,   // Great Eagle
+    282: 16.35,   // Great Elephant
+    283: 12.97,   // Gold Bird
+    284: 11.77,   // Ancient Dragon
+    285: 8.18,    // Rain Demon
+    286: 54.31,   // Flying General
+    287: 26.18,   // Angle General
+    288: 32.36,   // Fierce Dragon
+    289: 55.82,   // Flying Crocodile
+    290: 40.03,   // Vice General
+    291: 75.72,   // Great General
+    292: 37.43,   // Hook Mover
+    293: 20.21,   // Tengu
+    294: 28.23,   // Capricorn
+    295: 15.61,   // Peacock
+    296: 12.06,   // Heavenly Tetrarch King
+    297: 10.59,   // Lion
+    298: 11.45,   // Furious Fiend
+    299: 17.81,   // Buddhist Spirit
+    300: 15.34,   // Lion Hawk
+    1000: 100000, // King
+}
+
+// Material value, not including promotion possibilities
+// Not exist in this dir = same as in VALUES (or the piece cannot promote at all)
+const VALUES_PROMOTED = {
+    1: 0.76,    // Pawn
+    2: 1.16,    // Earth General
+    3: 1.16,    // Go-Between
+    4: 1.16,    // Stone General
+    5: 1.54,    // Iron General
+    6: 1.55,    // Dog
+    7: 1.52,    // Swooping Owl
+    8: 1.53,    // Old Rat
+    9: 1.52,    // Strutting Crow
+    10: 1.57,   // Tile General
+    11: 1.53,   // Sword Soldier
+    12: 1.89,   // Copper General
+    13: 1.92,   // Flying Goose
+    14: 1.88,   // Climbing Monkey
+    15: 1.9,    // Reclining Dragon
+    16: 1.85,   // Coiled Serpent
+    17: 1.87,   // Flying Chicken
+    18: 1.86,   // Cat Sword
+    19: 2.22,   // Evil Wolf
+    20: 2.25,   // Silver General
+    21: 2.25,   // Fierce Stag
+    22: 2.21,   // Blind Dog
+    23: 2.25,   // Huai Chicken
+    24: 2.2,    // Old Monkey
+    25: 2.51,   // Gold General
+    26: 2.55,   // Fierce Wolf
+    27: 2.48,   // Fierce Leopard
+    28: 2.53,   // Blind Monkey
+    29: 2.53,   // Blind Bear
+    30: 2.53,   // Angry Boar
+    31: 2.82,   // Drunken Elephant
+    32: 2.82,   // Neighboring King
+    34: 2.79,   // Deva
+    35: 2.83,   // Dark Spirit
+    36: 2.82,   // Blind Tiger
+    37: 2.16,   // Left General
+    38: 2.15,   // Right General
+    42: 1.49,   // Wood General
+    43: 2.56,   // Donkey
+    44: 2.52,   // Enchanted Badger
+    45: 2.42,   // Flying Horse
+    46: 3.97,   // Beast Cadet
+    47: 4.24,   // Fragrant Elephant
+    48: 4.32,   // White Elephant
+    49: 2.96,   // Rushing Bird
+    50: 2.52,   // Fierce Bear
+    51: 2.83,   // Eastern Barbarian
+    52: 2.8,    // Western Barbarian
+    53: 2.78,   // Northern Barbarian
+    54: 2.81,   // Southern Barbarian
+    55: 2.81,   // Prancing Stag
+    56: 3,      // Poisonous Serpent
+    57: 3.28,   // Old Kite
+    58: 3.61,   // Fierce Eagle
+    59: 3.01,   // Guardian of the Gods
+    60: 2.86,   // Sumo Wrestler
+    61: 4.77,   // Fowl Cadet
+    62: 2.16,   // Horse General
+    63: 2.16,   // Ox General
+    64: 2.16,   // Wind General
+    65: 2.16,   // River General
+    66: 2.37,   // Fire General
+    67: 2.49,   // Water General
+    68: 2.49,   // Mountain General
+    69: 2.86,   // Buddhist Devil
+    70: 2.71,   // Nature Spirit
+    72: 4.55,   // Fowl Officer
+    73: 4.59,   // Beast Officer
+    75: 1.93,   // Chicken General
+    76: 1.93,   // Pup General
+    77: 2.56,   // Pig General
+    78: 3.8,    // Mountain Stag
+    80: 3.22,   // Turtle Dove
+    81: 4.07,   // Crossbow Soldier
+    82: 4.57,   // Cannon Soldier
+    83: 2.01,   // Incense Chariot
+    84: 1.99,   // Ox Chariot
+    85: 2,      // Fierce Tiger
+    86: 2.68,   // Reverse Chariot
+    87: 4.66,   // Side Dragon
+    89: 6.8,    // White Foal
+    92: 6.57,   // Flying Chariot
+    93: 6.54,   // Soldier
+    94: 6.54,   // Running Chariot
+    95: 6.55,   // Square Mover
+    99: 5.85,   // Whale
+    100: 4.74,  // Angle Mover
+    104: 8.12,  // Flying Ox
+    108: 11.12, // Treacherous Fox
+    113: 10.01, // Free King
+    116: 2.29,  // Howling Dog (left)
+    117: 2.28,  // Howling Dog (right)
+    118: 3.02,  // Vertical Horse
+    119: 3.05,  // Spear Soldier
+    120: 3.04,  // Vertical Pup
+    124: 3.59,  // Vertical Leopard
+    127: 3.58,  // Ram's-head Soldier
+    128: 3.51,  // Flying Swallow
+    129: 3.63,  // Wood Chariot
+    130: 3.61,  // Tile Chariot
+    132: 3.65,  // Running Pup
+    133: 3.6,   // Running Serpent
+    134: 3.61,  // Earth Chariot
+    135: 3.62,  // Vertical Mover
+    136: 3.85,  // Fierce Ox
+    137: 3.48,  // Side Wolf
+    138: 3.48,  // Side Ox
+    139: 3.47,  // Side Mover
+    140: 3.43,  // Swallow's Wings
+    144: 4.01,  // Side Flyer
+    147: 4.67,  // Vermillion Sparrow
+    148: 4.56,  // Turtle Snake
+    149: 4.5,   // Side Boar
+    150: 4.79,  // Left Chariot
+    151: 4.81,  // Right Chariot
+    153: 4.5,   // Right Tiger
+    156: 5.66,  // Running Rabbit
+    160: 5.78,  // Running Wolf
+    163: 7.79,  // Dragon King
+    164: 7.05,  // Dragon Horse
+    166: 7.61,  // Wind Dragon
+    167: 7.64,  // Cloud Dragon
+    168: 6.3,   // Rain Dragon
+    172: 2.37,  // Vertical Tiger
+    175: 4.18,  // Running Tiger
+    176: 4.23,  // Running Bear
+    177: 3.95,  // Gold Stag
+    178: 3.21,  // Silver Rabbit
+    181: 4.39,  // Right Dragon
+    182: 4.46,  // Left Dragon
+    183: 5.89,  // Blue Dragon
+    184: 5.67,  // White Tiger
+    187: 6.28,  // Running Stag
+    188: 8.26,  // Rear Standard
+    191: 7.74,  // Horseman
+    193: 8.64,  // Woodland Demon
+    197: 9.08,  // Chariot Soldier
+    198: 8.76,  // Fire Demon
+    199: 8.84,  // Water Ox
+    201: 3.14,  // Wind Horse
+    202: 3.45,  // Vertical Bear
+    203: 3.46,  // Vertical Soldier
+    205: 3.96,  // Earth Dragon
+    206: 4.78,  // Silver Chariot
+    207: 4.82,  // Stone Chariot
+    208: 3.76,  // Side Soldier
+    209: 5.35,  // Gold Chariot
+    210: 5.85,  // Boar Soldier
+    211: 5.8,   // Leopard Soldier
+    212: 5.88,  // Bear Soldier
+    213: 8.28,  // Free Pup
+    217: 8.08,  // Little Standard
+    220: 6.77,  // Great Dragon
+    221: 8.45,  // Center Standard
+    222: 8.61,  // Front Standard
+    223: 7.84,  // Great Dove
+    225: 3.24,  // Vertical Wolf
+    226: 3.96,  // Side Serpent
+    227: 5.31,  // Cloud Eagle
+    229: 6.01,  // Horse Soldier
+    230: 6.11,  // Ox Soldier
+    236: 4.91,  // Longbow Soldier
+    238: 8.57,  // Fire Dragon
+    239: 8.38,  // Water Dragon
+    243: 9.11,  // Free Demon
+    244: 9.23,  // Free Dream-Eater
+    250: 1.17,  // Cassia Horse
+    251: 1.77,  // Flying Dragon
+    252: 3.21,  // Kirin
+    253: 3.33,  // Phoenix
+    254: 3.31,  // Flying Cat
+    255: 5.85,  // Running Horse
+    256: 9.73,  // Mountain Hawk
+    257: 9.42,  // Little Turtle
+    258: 7.96,  // Great Stag
+    259: 9.86,  // Left Mountain Eagle
+    260: 10.12, // Right Mountain Eagle
+    262: 9.59,  // Great Turtle
+    265: 10.18, // Horned Hawk
+    266: 10.39, // Flying Eagle
+    267: 10.85, // Roaring Dog
+    268: 11.52, // Lion Dog
+    283: 12.77, // Gold Bird
+    286: 53.88, // Flying General
+    287: 27.6,  // Angle General
+    288: 34.39, // Fierce Dragon
+    290: 29.96, // Vice General
+    294: 25.64, // Capricorn
+    295: 14.31, // Peacock
+    297: 10.44, // Lion
+}
+
+const material_value = (piece) => (piece.promoted && VALUES_PROMOTED[piece.id] !== undefined)
+    ? VALUES_PROMOTED[piece.id]
+    : VALUES[piece.id]

@@ -1,4 +1,5 @@
 const grid = document.getElementById('grid');
+const display_grid = document.getElementById('piece-move-grid')
 for (let i = 0; i < 1296; i++) {
     const cell = document.createElement('div');
     cell.className = 'cell';
@@ -11,9 +12,9 @@ for (let i = 0; i < 1296; i++) {
     grid.appendChild(cell);
 }
 
-let board = new Board()
+let global_game = new Game()
+let board = global_game.board // for ONCE the js laziness of only assigning references works in my favor
 
-// Must match the direction order used by Piece.get_legal_moves / Board.move.
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
 
 const COLOR_EMPTY = "#d4b855"   // board background
@@ -137,6 +138,59 @@ function render_intermediate() {
     }
 }
 
+function _get_grid_sizing_max(piece) {
+    // Helper function for side display.
+    // Returns max squares, including jumps, apart from "infinite" directions.
+    let max_squares = 2
+    for (let i in piece.dydx) {
+        if (piece.dydx[i] != 99 && piece.dydx[i] > max_squares) {
+            max_squares = piece.dydx[i] + 1
+        }
+    }
+
+    for (let i of piece.tp) {
+        if (Math.max(Math.abs(i[0]), Math.abs(i[1])) > max_squares) {
+            max_squares = Math.max(Math.abs(i[0]), Math.abs(i[1]))
+        } 
+    }
+    return max_squares
+}
+
+function update_ui() {
+    display_grid.innerHTML = ""
+    let piece = board.getPiece(selected[0], selected[1])
+    let display = 'inline-grid'
+    if (selected[0] != null) {
+        if (piece.is_empty()) {
+            display = 'none'
+        }
+        let max_squares = _get_grid_sizing_max(piece)
+        let size = (max_squares * 2 + 1)
+        display_grid.style = `display: ${display}; grid-template-columns: repeat(${size}, 26px); gap: 1px; background: #333; padding: 1px;`
+        for (let i = 0; i < (max_squares * 2 + 1) ** 2; i++) {
+            const cell = document.createElement('div');
+            cell.className = 'cell';
+            row = (size - 1 - Math.floor((size - 1) / 2)) - Math.floor(i / size);
+            col = i % size - Math.floor((size - 1) / 2);
+            cell.dataset.drow = row
+            cell.dataset.dcol = col
+            cell.id = `display-cell-[${row},${col}]`
+            cell.title = `display-cell-[${row},${col}]`
+            display_grid.appendChild(cell);
+        }
+
+        document.getElementById("display-cell-[0,0]").innerHTML = piece.short_name
+        document.getElementById("display-cell-[0,0]").style.color = piece_color(piece)
+        
+        let basex = 0
+        let basey = 0
+        let dirs = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
+        for (let i in piece.dydx) {
+
+        }
+    }
+}
+
 // Draw whatever the current modifier state calls for.
 function refresh() {
     if (X_HELD && intermediate != null) {
@@ -148,6 +202,8 @@ function refresh() {
     } else {
         render()
     }
+
+    update_ui()
 }
 
 function click(x, y) {
@@ -162,7 +218,7 @@ function click(x, y) {
 
     if (X_HELD) {
         if (intermediate == null) {
-            // Stage one: did the player pick a usable first leg?
+            // Did the player pick a usable first leg?
             for (let special of first_leg_directions(moves_able)) {
                 let dir = DIRS[special - 1]
                 if (selected[0] + dir[0] === x && selected[1] + dir[1] === y) {
@@ -172,7 +228,7 @@ function click(x, y) {
                 }
             }
         } else {
-            // Stage two: commit the full medium move if this is a real destination.
+            // Commit the full medium move if this is a real destination.
             let move = intermediate * 1296 + 36 * x + y
             if (moves_able.includes(move)) {
                 board.move(selected[0], selected[1], move)
@@ -182,7 +238,7 @@ function click(x, y) {
                 return
             }
         }
-        // Anything else abandons the medium move and re-selects.
+        // Abandon the medium move and re-select.
         intermediate = null
         selected = [null, null]
         click(x, y)
@@ -239,40 +295,3 @@ window.addEventListener('mousedown', function(e) {
 
 render()
 
-if (false) {//confirm('Do you want to random move')) {
-    // Comment this out
-    let turn = 1
-    let count = 0
-    let a = setInterval(() => {
-        let all_moves = []
-        let choose_x = Math.floor(Math.random() * 36)
-        let choose_y = Math.floor(Math.random() * 36)
-        while (board.board[choose_x][choose_y].id == 0 || board.board[choose_x][choose_y].color != turn) {
-            choose_x = Math.floor(Math.random() * 36)
-            choose_y = Math.floor(Math.random() * 36)
-        }
-        all_moves = board.board[choose_x][choose_y].get_legal_moves(board)
-        if (all_moves.length == 0) {
-            ;
-        } else {
-            let chosen_move = all_moves[Math.floor(Math.random() * all_moves.length)]
-            chosen_move = [Math.floor(chosen_move / 36) % 36, chosen_move % 36]
-            if (board.board[chosen_move[0]][chosen_move[1]].id == 1000 || board.board[chosen_move[0]][chosen_move[1]].id == 11000) {
-                alert(turn == 1 ? "Black won!" : "White won!")
-            }
-            try {
-                board.board[chosen_move[0]][chosen_move[1]] = board.board[choose_x][choose_y].copy(chosen_move[0], chosen_move[1])
-                board.board[choose_x][choose_y] = PIECES[0].copy(choose_x, choose_y)
-                //render()
-            } catch {
-                ;
-            }
-            turn = 1 - turn
-            count += 1
-            //console.log(count)
-            if (count % 100 == 0) {
-                render()
-            }
-        }
-    }, 1)
-}

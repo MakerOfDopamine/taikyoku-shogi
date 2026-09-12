@@ -1,0 +1,98 @@
+{
+  "n_samples": 2616095,
+  "criterion": "S maximises the entropy of tanh(material/S) over 128 bins on [-1,1]",
+  "global_S_pawns": 246.78,
+  "material_pawns": {
+    "mean": -0.341,
+    "sd": 220.729,
+    "abs_p50": 133.42,
+    "abs_p90": 371.51,
+    "abs_p99": 603.53,
+    "min": -1015.46,
+    "max": 1025.31
+  },
+  "label": {
+    "entropy_normalised": 0.9986,
+    "sd": 0.5778,
+    "frac_saturated_abs_gt_0.95": 0.0498,
+    "frac_in_high_gradient_abs_x_lt_1.5": 0.8989,
+    "deciles": [
+      -0.808,
+      -0.601,
+      -0.39,
+      -0.188,
+      0.0,
+      0.178,
+      0.384,
+      0.603,
+      0.815
+    ]
+  },
+  "cross_check_S_from_p95_rule": 306.8,
+  "per_ply_S_pawns": [
+    {
+      "ply_lo": 0,
+      "ply_hi": 25,
+      "n": 136632,
+      "S_pawns": 76.7,
+      "mean_pieces": 763.0,
+      "sd_material": 67.1
+    },
+    {
+      "ply_lo": 25,
+      "ply_hi": 50,
+      "n": 112725,
+      "S_pawns": 122.0,
+      "mean_pieces": 715.0,
+      "sd_material": 108.7
+    },
+    {
+      "ply_lo": 50,
+      "ply_hi": 100,
+      "n": 216186,
+      "S_pawns": 159.1,
+      "mean_pieces": 677.3,
+      "sd_material": 139.7
+    },
+    {
+      "ply_lo": 100,
+      "ply_hi": 200,
+      "n": 412249,
+      "S_pawns": 205.0,
+      "mean_pieces": 624.1,
+      "sd_material": 180.7
+    },
+    {
+      "ply_lo": 200,
+      "ply_hi": 400,
+      "n": 662610,
+      "S_pawns": 257.3,
+      "mean_pieces": 553.2,
+      "sd_material": 225.3
+    },
+    {
+      "ply_lo": 400,
+      "ply_hi": 800,
+      "n": 730425,
+      "S_pawns": 297.1,
+      "mean_pieces": 469.2,
+      "sd_material": 258.8
+    },
+    {
+      "ply_lo": 800,
+      "ply_hi": 1600,
+      "n": 320959,
+      "S_pawns": 309.8,
+      "mean_pieces": 386.2,
+      "sd_material": 270.9
+    },
+    {
+      "ply_lo": 1600,
+      "ply_hi": null,
+      "n": 24309,
+      "S_pawns": 304.7,
+      "mean_pieces": 313.3,
+      "sd_material": 265.8
+    }
+  ]
+}
