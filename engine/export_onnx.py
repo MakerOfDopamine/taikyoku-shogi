@@ -1,5 +1,11 @@
 """Export checkpoint.pt to ONNX for the C self-play driver.
 
+A checkpoint of model_policy.TaikyokuShogiBot (one with a policy head) also gets a policy
+graph per precision, net_<p>_policy.onnx: inputs `board` (1, 1296) int32 as below and
+`moves` (M, 3) int32 rows of (from square, to square, special), in the board's canonical
+frame; output `logits` (M,). nnplay ranks every legal move with it and has the value head
+score only the top few. The value graph of such a model returns `value` alone.
+
 Writes two graphs from the same weights: net_fp32.onnx and net_fp16.onnx, each put through
 ONNX Runtime's offline transformer fusion so the 1296-token attention runs as a fused
 kernel instead of a materialised 1296x1296 score matrix. Both take a
@@ -22,8 +28,7 @@ import shutil
 import numpy as np
 import torch
 
-from model import TaikyokuShogiBot
-from export_rewrite import rewrite
+from export_rewrite import rewrite, attention_shape
 
 NSQ = 36 * 36
 NUM_EMBEDDING = 603          # unpack.embedding_index range: 0 empty, then index*2 + colour
@@ -37,15 +42,38 @@ class Wrapped(torch.nn.Module):
         self.net = net
 
     def forward(self, board):
-        return self.net(board.to(torch.int64))
+        # the policy model's forward gives (value, None) without moves; legacy (value, material)
+        return tuple(t for t in self.net(board.to(torch.int64)) if t is not None)
+
+
+class PolicyWrapped(torch.nn.Module):
+    """board (1, 1296) and moves (M, 3) int32 in, one logit per move out."""
+
+    def __init__(self, net):
+        super().__init__()
+        self.net = net
+
+    def forward(self, board, moves):
+        m = moves.to(torch.int64)
+        rows = torch.zeros_like(m[:, :1])            # every move belongs to board 0
+        return self.net(board.to(torch.int64), torch.cat([rows, m], 1))[1]
+
+
+def has_policy(net):
+    return hasattr(net, "unpatch")
 
 
 def load(path, device):
-    net = TaikyokuShogiBot().to(device)
     ckpt = torch.load(path, map_location=device, weights_only=False)
-    net.load_state_dict(ckpt["model"])
+    sd = ckpt["model"] if "model" in ckpt else ckpt
+    if any(k.startswith("unpatch.") for k in sd):
+        from model_policy import TaikyokuShogiBot
+    else:
+        from model import TaikyokuShogiBot
+    net = TaikyokuShogiBot().to(device)
+    net.load_state_dict(sd)
     net.eval()
-    return net, ckpt.get("epoch")
+    return net, ckpt.get("epoch") if isinstance(ckpt, dict) else None
 
 
 def fuse(path, nhead, hidden, verbose):
@@ -76,14 +104,59 @@ def export(net, out, dtype, device, opset, bert_shaped):
         rewrite(inner)
     m = Wrapped(inner).to(device=device, dtype=dtype).eval()
     dummy = torch.zeros((2, NSQ), dtype=torch.int32, device=device)
+    outs = ["value"] if has_policy(net) else ["value", "material"]
     with torch.no_grad():
         torch.onnx.export(
             m, (dummy,), out,
-            input_names=["board"], output_names=["value", "material"],
-            dynamic_axes={"board": {0: "batch"}, "value": {0: "batch"}, "material": {0: "batch"}},
+            input_names=["board"], output_names=outs,
+            dynamic_axes={"board": {0: "batch"}, **{o: {0: "batch"} for o in outs}},
             opset_version=opset, do_constant_folding=True,
         )
     return out
+
+
+def export_policy(net, out, dtype, device, opset, bert_shaped):
+    inner = copy.deepcopy(net)
+    if bert_shaped:
+        rewrite(inner)
+    m = PolicyWrapped(inner).to(device=device, dtype=dtype).eval()
+    board = torch.zeros((1, NSQ), dtype=torch.int32, device=device)
+    moves = torch.zeros((5, 3), dtype=torch.int32, device=device)
+    with torch.no_grad():
+        torch.onnx.export(
+            m, (board, moves), out,
+            input_names=["board", "moves"], output_names=["logits"],
+            dynamic_axes={"moves": {0: "moves"}, "logits": {0: "moves"}},
+            opset_version=opset, do_constant_folding=True,
+        )
+    return out
+
+
+def start_position_moves():
+    """The start position's legal moves in nnplay's generation order, as canonical
+    (from, to, special) rows -- black is to move, so no rotation. Built through tkykids.c,
+    the same generator nnplay runs, so selfcheck can match move for move."""
+    import ctypes
+    import subprocess
+    import tempfile
+    d = tempfile.mkdtemp()
+    so = os.path.join(d, "libtkykids.so")
+    subprocess.run(["gcc", "-O2", "-shared", "-fPIC", "-o", so, "tkykids.c", "-lm"], check=True,
+                   cwd=os.path.dirname(os.path.abspath(__file__)))
+    lib = ctypes.CDLL(so)
+    lib.tk_init()
+    from unpack import INIT_BOARD
+    board = np.ascontiguousarray(INIT_BOARD, dtype=np.uint16)
+    buf = np.zeros(8192, np.uint32)
+    forced = ctypes.c_uint32()
+    P = ctypes.POINTER
+    lib.tk_moves.argtypes = [P(ctypes.c_uint16), ctypes.c_int, P(ctypes.c_uint32), ctypes.c_int,
+                             P(ctypes.c_uint32)]
+    n = lib.tk_moves(board.ctypes.data_as(P(ctypes.c_uint16)), 1, buf.ctypes.data_as(P(ctypes.c_uint32)),
+                     len(buf), ctypes.byref(forced))
+    mv = buf[:n].astype(np.int64)
+    shutil.rmtree(d, ignore_errors=True)
+    return np.stack([(mv >> 17) & 0x7FF, (mv >> 6) & 0x7FF, mv >> 28], 1).astype(np.int32)
 
 
 def main():
@@ -106,7 +179,8 @@ def main():
 
     if not a.no_fuse:
         import onnxruntime
-        want = open("third_party/onnxruntime/VERSION_NUMBER").read().strip()
+        vf = "third_party/onnxruntime/VERSION_NUMBER"
+        want = open(vf).read().strip() if os.path.exists(vf) else onnxruntime.__version__
         if onnxruntime.__version__ != want:
             print(f"WARNING: onnxruntime python is {onnxruntime.__version__} but the C library in "
                   f"third_party/onnxruntime is {want}. The fused contrib ops may not load; "
@@ -131,7 +205,20 @@ def main():
             for at in range(0, probe.shape[0], a.chunk):
                 for k, t in enumerate(m(probe[at:at + a.chunk])):
                     out[k].append(t.float().cpu().numpy().ravel())
-        return tuple(np.concatenate(o) for o in out)
+        v = np.concatenate(out[0])
+        mat = np.concatenate(out[1]) if out[1] else np.zeros_like(v)   # no material head
+        return v, mat
+
+    pol_moves = torch.from_numpy(np.stack([rng.integers(0, NSQ, 600), rng.integers(0, NSQ, 600),
+                                           rng.integers(0, 10, 600)], 1).astype(np.int32)).to(device)
+
+    def run_policy(net_, dtype, bert_shaped=False):
+        inner = copy.deepcopy(net_)
+        if bert_shaped:
+            rewrite(inner)
+        m = PolicyWrapped(inner).to(device=device, dtype=dtype).eval()
+        with torch.no_grad():
+            return m(probe[:1], pol_moves).float().cpu().numpy()
 
     # TransformerEncoderLayer's fused eval-mode fast path is one fat aten op with no ONNX
     # symbolic; turning it off recovers the decomposed graph. Same arithmetic, not fused,
@@ -142,13 +229,19 @@ def main():
     ref_v, ref_m = run(net, torch.float32)
     print(f"fused vs decomposed attention (both fp32): max|dv| = {np.abs(fused_v - ref_v).max():.3e}")
 
+    nhead, hidden = attention_shape(net)
+    print(f"encoder: {len(net.transformers.layers)} layers, {nhead} heads, d_model {hidden}")
     bert_shaped = not a.packed_attention
     if bert_shaped:
         bv, bm = run(net, torch.float32, bert_shaped=True)
         print(f"BERT-shaped attention rewrite (both fp32): max|dv| = {np.abs(bv - ref_v).max():.3e}")
 
+    policy = has_policy(net)
+    ref_p = run_policy(net, torch.float32) if policy else None
+    print("policy head: " + ("yes -- exporting a policy graph per precision" if policy
+                            else "none (a legacy model): nnplay play/elo/variance will refuse it"))
     manifest = {"checkpoint": a.checkpoint, "epoch": epoch, "opset": a.opset,
-                "num_embedding": NUM_EMBEDDING, "nsq": NSQ,
+                "num_embedding": NUM_EMBEDDING, "nsq": NSQ, "policy": policy,
                 "bert_shaped_attention": bert_shaped, "fused": not a.no_fuse, "graphs": {}}
     for name, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
         path = f"{a.out_dir}/net_{name}.onnx"
@@ -159,7 +252,7 @@ def main():
             # thing to re-fuse with if some future runtime will not load the fused one
             raw = path.replace(".onnx", "_raw.onnx")
             shutil.copyfile(path, raw)
-        nfused = fuse(path, 8, 256, True) if bert_shaped and not a.no_fuse else 0
+        nfused = fuse(path, nhead, hidden, True) if bert_shaped and not a.no_fuse else 0
         v, mat = run(net, dtype, bert_shaped)
         dv = float(np.abs(v - ref_v).max())
         dm = float(np.abs(mat - ref_m).max())
@@ -168,6 +261,24 @@ def main():
                                     "attention_fused": nfused,
                                     "max_abs_dev_value": dv, "max_abs_dev_material": dm}
         print(f"wrote {path}  sha={digest}  max|dv| vs fp32 torch = {dv:.3e}  max|dm| = {dm:.3e}")
+        if policy:
+            ppath = f"{a.out_dir}/net_{name}_policy.onnx"
+            export_policy(net, ppath, dtype, device, a.opset, bert_shaped)
+            praw = None
+            if bert_shaped and not a.no_fuse:
+                praw = ppath.replace(".onnx", "_raw.onnx")
+                shutil.copyfile(ppath, praw)
+            pf = fuse(ppath, nhead, hidden, True) if bert_shaped and not a.no_fuse else 0
+            dp = float(np.abs(run_policy(net, dtype, bert_shaped) - ref_p).max())
+            # and through ONNX Runtime itself: the move gather is new in this graph
+            import onnxruntime as ort
+            sess = ort.InferenceSession(ppath, providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+            got = sess.run(None, {"board": probe[:1].cpu().numpy(), "moves": pol_moves.cpu().numpy()})[0]
+            dpo = float(np.abs(got.astype(np.float32) - ref_p).max())
+            manifest["graphs"][name + "_policy"] = {"path": ppath, "raw": praw, "attention_fused": pf,
+                                                    "max_abs_dev_torch": dp, "max_abs_dev_onnxruntime": dpo}
+            print(f"wrote {ppath}  fused {pf}  max|dlogit| vs fp32 torch: torch {dp:.3e}, "
+                  f"onnxruntime {dpo:.3e}  (logit spread {ref_p.std():.3f})")
 
     # The value of the start position, so a bundle can verify a runtime reproduces *these*
     # weights. It has to travel with the graph: baking it into setup.sh at bundle time made
@@ -181,6 +292,15 @@ def main():
     manifest["selfcheck"] = {"start_position_value": sv, "tolerance": 3e-3,
                              "note": "fp32 torch; fp16 and TF32 both land well inside the tolerance"}
     print(f"start-position value (fp32 torch) = {sv:+.9f}")
+    if policy:
+        mv = start_position_moves()
+        with torch.no_grad():
+            lg = PolicyWrapped(copy.deepcopy(net)).to(device).eval()(
+                start, torch.from_numpy(mv).to(device)).float().cpu().numpy()
+        manifest["selfcheck"]["start_position_policy_moves"] = mv.ravel().tolist()
+        manifest["selfcheck"]["start_position_policy_logits"] = [float(x) for x in lg]
+        manifest["selfcheck"]["policy_tolerance"] = 0.05
+        print(f"start-position policy (fp32 torch): {len(mv)} moves, logits {lg.min():+.3f}..{lg.max():+.3f}")
 
     # The Elo baseline: the same graphs from a second checkpoint, so `nnplay elo` can rate
     # this network against the previous one instead of against random.
@@ -192,9 +312,17 @@ def main():
         for name, dtype in (("fp32", torch.float32), ("fp16", torch.float16)):
             path = f"{a.out_dir}/baseline_{name}.onnx"
             export(bnet, path, dtype, device, a.opset, bert_shaped)
-            nf = fuse(path, 8, 256, True) if bert_shaped and not a.no_fuse else 0
+            nf = fuse(path, nhead, hidden, True) if bert_shaped and not a.no_fuse else 0
             manifest["baseline"]["graphs"][name] = {"path": path, "attention_fused": nf}
             print(f"wrote {path}  fused {nf}")
+            if has_policy(bnet):
+                ppath = f"{a.out_dir}/baseline_{name}_policy.onnx"
+                export_policy(bnet, ppath, dtype, device, a.opset, bert_shaped)
+                nf = fuse(ppath, nhead, hidden, True) if bert_shaped and not a.no_fuse else 0
+                manifest["baseline"]["graphs"][name + "_policy"] = {"path": ppath, "attention_fused": nf}
+                print(f"wrote {ppath}  fused {nf}")
+        if not has_policy(bnet):
+            print(f"  {a.baseline} has no policy head: nnplay elo will refuse it as a baseline")
     elif explicit:
         sys.exit(f"--baseline {a.baseline} does not exist")
     else:

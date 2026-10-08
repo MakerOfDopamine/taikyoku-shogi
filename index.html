@@ -15,23 +15,38 @@
         }
         .cell {
             width: 26px;
-            height: 24px;
+            height: 23px;
             background: #d4b855;
             border: none;
             text-align: center;
             font-size: 12px;
+            align-content: center;
+        }
+        .section {
+            display: inline-block;
+            border: 3px solid black;
+            padding: 10px;
+            padding-top: 3px
         }
     </style>
 </head>
 <body>
     <div id="main-container" style="display: flex; flex-direction: row; gap: 16px">
-        <div id="grid"></div>
-        <div id="side-panel">
-            <div id="inspector">
-                <div id="piece-info"></div><br>
-                <div id="piece-move-grid" style="display: none; gap: 1px; background: #333; padding: 1px;"></div>
+        <div id="side-panel-left" style="flex: 1; min-width: 0;"></div>
+        <div id="grid" style="flex: 0 0 500px"></div>
+        <div id="side-panel" style="flex: 2; min-width: 0;">
+            <div id="inspector" class="section">
+                <h3 style="white-space: nowrap; margin-top: 5px; margin-bottom: 5px;">Piece Information</h3>
+                <div id="piece-info"></div>
+                <div id="piece-move-grid" style="display: none; gap: 1px; background: #333;"></div>
             </div>
             <br><br>
+            <div id="lookup" class="section">
+                <form id="lookup-form">
+                    <input type="text" id="piece-id-lookup"><br>
+                    <button type="submit">Find Piece</button>
+                </form>
+            </div><br><br>
             <button id="testing">
                 Hello!
             </button>

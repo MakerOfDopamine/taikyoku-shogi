@@ -33,14 +33,25 @@ rm -rf "$OUT"
 mkdir -p "$OUT"
 # engine: nnplay.c includes tky.c, which includes tables.h. That is the whole rules stack.
 cp nnplay.c tky.c tables.h "$OUT"/
+# the policy trainer builds this into a move generator for archives without .kids files
+cp tkykids.c "$OUT"/
 # The header only. The C API is versioned inside it and newer runtimes still serve older
 # API versions, so it works with whichever onnxruntime-gpu setup.sh downloads.
 cp third_party/onnxruntime/include/onnxruntime_c_api.h "$OUT"/
 cp net_fp16.onnx net_fp16_raw.onnx "$OUT"/
+# the policy graph: play, elo and variance refuse a model without one
+if [ -f net_fp16_policy.onnx ]; then
+    cp net_fp16_policy.onnx "$OUT"/
+    [ -f net_fp16_policy_raw.onnx ] && cp net_fp16_policy_raw.onnx "$OUT"/
+else
+    echo "  (no net_fp16_policy.onnx: this is a legacy model, and nnplay play/elo/variance will"
+    echo "   refuse it. Export a model_policy.py checkpoint with export_onnx.py first)"
+fi
 if [ "$FP32" = 1 ]; then cp net_fp32.onnx "$OUT"/; fi
 # the Elo baseline, when one has been exported
 if [ -f baseline_fp16.onnx ]; then
     cp baseline_fp16.onnx "$OUT"/
+    [ -f baseline_fp16_policy.onnx ] && cp baseline_fp16_policy.onnx "$OUT"/
     if [ "$FP32" = 1 ] && [ -f baseline_fp32.onnx ]; then cp baseline_fp32.onnx "$OUT"/; fi
 else
     echo "  (no baseline_fp16.onnx: 'nnplay elo' in this bundle will need --baseline random)"
@@ -54,7 +65,7 @@ if [ "$TESTS" = 1 ]; then
     cp shard_0000.tkp "$OUT"/ 2>/dev/null || echo "  (no shard_0000.tkp: the encode and torch checks need one)"
 fi
 if [ "$EXPORT" = 1 ]; then
-    cp export_onnx.py export_rewrite.py model.py checkpoint.pt "$OUT"/
+    cp export_onnx.py export_rewrite.py model.py model_policy.py checkpoint.pt "$OUT"/
     if [ -f baseline.pt ]; then cp baseline.pt "$OUT"/; fi
 fi
 
@@ -137,4 +148,5 @@ EOF
 echo "$OUT: $(du -sh "$OUT" | cut -f1), $(find "$OUT" -type f | wc -l) files"
 ls -la "$OUT" | awk 'NR>1 && $5 != "" && $9 != "." && $9 != ".." {printf "  %9.1f KB  %s\n", $5/1024, $9}'
 echo
-echo "tar it up:  tar czf $OUT.tgz $OUT"
+#echo "tar it up:  tar czf $OUT.tgz $OUT"
+tar czf nnplay-bundle.tgz nnplay-bundle

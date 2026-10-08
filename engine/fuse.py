@@ -19,7 +19,7 @@ from onnxruntime.transformers.fusion_options import FusionOptions
 if len(sys.argv) != 3:
     sys.exit(__doc__)
 
-m = optimizer.optimize_model(sys.argv[1], model_type="bert", num_heads=8, hidden_size=256,
+m = optimizer.optimize_model(sys.argv[1], model_type="bert", num_heads=4, hidden_size=128,
                              opt_level=0, optimization_options=FusionOptions("bert"))
 stats = m.get_fused_operator_statistics()
 m.save_model_to_file(sys.argv[2])

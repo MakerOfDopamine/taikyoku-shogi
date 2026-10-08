@@ -471,6 +471,85 @@ trample level rule does not cover. The chosen leaf still goes through the networ
 own so every ply carries a real value, and the record is flagged. `--no-regicide` hands
 the decision back to the network.
 
+**King safety**, the mirror rule, on by default: a move that leaves the mover's own King
+capturable is never played while some move avoids it. Without it the bot gave games away.
+In a 2M-position corpus at T=0.3 the side to move escaped a threatened King only ~14% of
+the time, and 7.1% of games opened with the Great General sweeping its file to the square
+beside the enemy King -- a threat with five one-move answers, all of which take the
+General, that White found 35% of the time. The cause is the softmax, not the net: the net
+saw the danger, but a handful of defences at weight ~1 are outweighed by hundreds of
+King-hanging moves at `exp(-0.99/0.3) ~ 0.037` each.
+
+The check is exact. The candidate move is played on a copy and the opponent's replies go
+through the forced-regicide detector; a move that removes its own King (a Free Eagle
+sweeping over it) counts as hanging it. It is applied by rejection: sample from the
+softmax, and if the pick hangs the King, drop it and sample again from the rest. That is
+exactly the softmax restricted to safe moves, and on an ordinary ply it costs one check,
+6.6 us against a ply's ~14 ms of network time. If no scored child is safe -- the policy's
+picks are only a few percent of the moves -- the unscored children are checked and only the
+safe ones are sent to the network, so pruning cannot hide the defence. If nothing is safe, the King is lost
+anyway and the pick is made as before. Plies where the rule changed the pick carry flag 16,
+and the run summary counts them.
+
+It applies in `play`, `variance` and to both sides in `elo`, the uniform-random baseline
+included. `subsample` is unchanged. `--no-king-safety` turns it off, and the file header
+records which was used. `nnplay safetytest` checks it without a GPU: the check against
+`tky.c`'s slow detector on every legal move of positions from random games (0 mismatches
+over 3.2M moves), the five answers to the sweep, and the sampling distribution against the
+restricted softmax.
+
+**Adjudication**, also on by default, because the result was a label the value head could
+not learn: in the 2M-position T=0.3 corpus the side ahead on material won only 52-57% of
+games at leads of 200-300 pawns, since the game was decided by whichever side first missed
+a King capture. Two rules make the label follow material instead:
+
+* **Resignation.** A side ahead by `--resign-lead` pawns (default 300) for
+  `--resign-plies` plies in a row (default 10) is scored the winner, termination 5
+  `resignation`. 300 pawns is ~13% of a side's 2345-pawn start. The threshold is the lead
+  that does not come back: over 27k self-play games, a 300-pawn lead held 10 plies was later
+  reversed -- the other side going 300 ahead -- in 0.1-0.7% of games, against 1-3% at 200.
+  Holding it is what stops a single Great General trample, which can swing ~370 pawns in one
+  ply, from ending a game. `--resign-lead 0` turns it off.
+* **Ply cap.** A capped game goes to the side ahead on material, and is a draw when the
+  lead is under 50 pawns (fixed; format version 5 on, version 4 drew only an exact tie). It
+  used to be written as a draw it never was: 91% of capped games in the T=1.0 corpus ended
+  at least 50 pawns apart. `--cap-draw` makes every capped game a draw again.
+
+  For a softer target than +/-1 on capped games, e.g. `tanh(material / scale)`, compute it
+  at training time: termination 4 in the game header marks them, and the last ply record's
+  `material` is the final balance.
+
+Both apply wherever games are played: `play`, the `variance` main line and its playouts
+(which inherit the main line's count of plies the lead has held), and `elo`. The header
+records the settings. Re-measure the threshold once play changes -- King safety changes it
+-- with `tkn_stats.py --adjudication` on a batch generated with `--resign-lead 0`; a corpus
+that already resigned stops at the rule in force and cannot show what lies past it.
+
+## Sizing a run by positions
+
+`--positions N` plays whole games until at least N positions have been written, however
+many games that takes, which is usually what you want when filling a training corpus.
+
+```
+./nnplay play --positions 200000 --temperature 0.3 --out selfplay.tkn
+```
+
+It **overshoots rather than truncating the last game**: a game cut short would be written
+with a result it never reached, and every position in it would carry a value target that is
+simply wrong. Game lengths vary enormously here -- 3 to 20 plies inside one short run -- so
+expect to land a little over the target. Passing `--games` as well turns it into a cap on
+the number of games, for bounding a run that might otherwise take longer than you want.
+
+The progress line counts toward the target:
+
+```
+game 19: 20 plies, draw by ply-cap, 3.9s (2835 boards/s)  [193/200 positions]
+game 20: 10 plies, white by royal, 1.1s (2836 boards/s)  [203/200 positions]
+```
+
+The file header records the games and plies actually written rather than the number asked
+for, so a `--positions` shard is self-describing in the same way a `--games` one is.
+
 ## Sub-batching
 
 A ply is ~1300 boards and will not fit on a GPU at once, so `nnplay` measures at startup
@@ -560,6 +639,57 @@ game 7    bot=white win  in    4 plies (  1.4s) |    8W    0L    0D  score 1.000
 `--temperature` defaults to **0** here, which measures playing strength; pass it explicitly
 to rate the sampling policy you actually generate data with instead.
 
+### When to stop: SPRT, on by default
+
+A match stops as soon as the games settle the question "is the bot at least `elo1` better
+than the baseline, or at most `elo0`?" -- a sequential probability ratio test, with
+`--games` as the upper limit. Defaults: `--sprt 0,50`, `--alpha 0.05 --beta 0.05`, at most
+1000 games. Each game line carries the log-likelihood ratio and its bounds, `LLR +1.23
+[-2.94, 2.94]`, and the summary states which hypothesis was accepted, or that the limit was
+reached first, in which case the Bayesian interval is the result.
+
+The bounds are in **logistic Elo**, the rating a score implies, `s = 1/(1+10^(-elo/400))`;
+the BayesElo rating printed beside it uses a different scale once there are draws. The draw
+rate is a nuisance parameter maximised out under each hypothesis -- fishtest's generalised
+SPRT -- but computed exactly, by constrained maximum likelihood, not with the usual normal
+approximation. Against a random baseline the bot wins every game, the observed variance is
+zero, and the approximation would accept H1 after two or three wins; exactly, N straight
+wins is the binomial `N log(s1/s0)`, so the default needs 23.
+
+Measured by simulation, on game results drawn from the model with 7% draws and a 30-Elo
+first-move advantage alternating with colour:
+
+| true logistic Elo | accepts H1 | accepts H0 | undecided at 1000 | games, mean (p90) |
+|---|---|---|---|---|
+| -50 | 0% | 100% | 0% | 94 (152) |
+| 0 | 5.4% | 93.5% | 1.1% | 256 (491) |
+| +25 | 48.7% | 45.5% | 5.8% | 389 (815) |
+| +50 | 94.5% | 4.8% | 0.7% | 252 (492) |
+| +100 | 100% | 0% | 0% | 98 (162) |
+| +800 (a random baseline) | 100% | 0% | 0% | 23 (23) |
+
+The error rates hold at their nominal 5% despite the colour effect, and the 1000-game limit
+leaves ~1% of matches on the boundaries undecided, against ~15% at 400. A finer band costs
+more: `--sprt 0,30` averages ~590 games at +0. `--sprt -30,0` asks the opposite question,
+"is the new net no worse?". `--no-sprt` plays exactly `--games` games, as before.
+
+### Keeping the positions (`--out`)
+
+A rating match is hundreds of games of real play, so `--out FILE` keeps them: every
+position, in the same `.tkn` format as self-play, written a game at a time so a killed run
+keeps what it finished. It merges with self-play files (`merge_tkn.py`) and reads with the
+same tools.
+
+Every ply's `value` is the **rated** net's value of the resulting position, whoever moved,
+so the file holds one network's opinions just as a self-play file does. The opponent's moves
+cost one extra board through the rated net for that; the baseline's own values are not kept.
+Moves made by the baseline or the random mover carry ply flag 32 (`opponent_move` in
+`unpack_nn.py` and the notebook reader), and the header records the match's temperature.
+With `--out` that defaults to **0.3** rather than `elo`'s usual 0: greedy games measure
+strength but are the least varied training data there is. The rating then describes the
+sampling policy, not greedy play; pass `--temperature 0` to keep greedy games anyway.
+Against the random mover, `n_scored` is 1 on its moves: it scores nothing.
+
 ### The model
 
 BayesElo's, not a normal approximation to a win rate: Rao-Kupper with an explicit draw
@@ -601,6 +731,35 @@ lower bound alone: 100 wins in 100 games says "at least +846", not "+1500".
 `test_nnplay.py` checks all of this -- `elotest` opens no ONNX session, so the estimator is
 tested without a GPU.
 
+### Rating the cost of the policy's pruning (`--vs-full`)
+
+`--vs-full` answers the question `subsample` cannot: what does scoring only the policy's
+picks cost in *strength*, rather than in the net's own value. The net plays itself with one
+session driving both sides -- the rated side scoring the policy's top `--policy-top` plus
+`--policy-explore` at random, its opponent scoring every child -- so no baseline graph is
+involved and nothing but the evaluation budget differs between the players.
+
+```
+./nnplay elo --vs-full --temperature 0.3
+```
+
+The rated side really does evaluate only those children, so the reported work ratio is a
+genuine throughput figure (6.7% at the defaults, in a test). `--policy-top 1` is the
+control: both sides score everything and it must rate 0. This replaces `--subset-fraction`,
+which priced a *random* slice the same way and is gone with random subsetting itself.
+
+**Budget the match before reading it.** The interval narrows as sqrt(games), and at these
+branching factors 8 games gives about +/-250 Elo, which is worth nothing:
+
+| games | 95% interval, roughly |
+|---|---|
+| 8 | +/-250 |
+| 100 | +/-71 |
+| 400 | +/-35 |
+| 1600 | +/-18 |
+
+The SPRT (on by default) stops as soon as the result is clear.
+
 ### Which baseline
 
 The default opponent is `baseline_<precision>.onnx`, which `export_onnx.py` writes from
@@ -634,6 +793,196 @@ every game with a given colour is the same game: the 20-game record above is two
 games copied ten times, and its interval is correspondingly far too narrow to believe.
 `elo` warns when it sees this. Against the *random* baseline temperature 0 is fine, because
 the opponent supplies the variation.
+
+## What does evaluating only some children cost? (`nnplay subsample`)
+
+A ply costs one network evaluation per legal move, so the obvious saving is to score only
+a fraction of them. This measures what that fraction costs.
+
+```
+./nnplay subsample --games 20 --max-plies 200 --temperature 0.3 \
+                   --proportions 0.8,0.6,0.4,0.2,0.1,0.05,0.02 --repeats 16 --csv sub.csv
+```
+
+Every proportion is measured on the **same positions**, from one self-play pass. The
+subset's values are read out of the full evaluation rather than run as their own batch,
+which is exact and not an approximation: a child's value does not depend on which other
+children shared its batch. Only fp16 batch-shape rounding does, and `--verify N` re-runs
+subsets as real GPU batches to measure it -- 1.2e-04 on the development GPU. Being exact
+is what makes every extra proportion and repeat free.
+
+Reported per proportion: top-1 agreement with the full evaluation, the mean/sd/percentiles
+and max of the argmax loss, the policy loss, the rank of the chosen child, and the subset's
+own spread statistics. `--csv` writes one row per position, proportion and repeat.
+
+**Two losses, because there are two questions.** `loss` is `best_full - best_subset` in the
+mover's frame -- what a greedy player gives up. `policy loss` compares the *expected* value
+of sampling at the temperature in use from the subset against sampling from everything, and
+is the relevant number when the engine samples rather than taking the argmax. The argmax
+loss is its `T -> 0` case. Policy loss can come out slightly negative: dropping children at
+random removes bad ones as often as good ones, and a softmax over the survivors can expect
+marginally more than one over the full set.
+
+**Read top-1 agreement, not mean loss.** On the current network the value landscape is
+bimodal: at most positions one child sits near the tanh ceiling (~+0.96) while the whole
+rest of the pack is around -0.05, a gap of ~0.68 to the 95th percentile. The argmax loss is
+therefore all-or-nothing -- you either sample that one move or you lose ~0.95 -- so its mean
+is just the miss rate times 0.95 and its median is 0. Measured over 24 positions:
+
+| fraction | top-1 agreement | mean loss | median loss | policy loss at T=0.3 |
+|---|---|---|---|---|
+| 0.80 | 78.6% | 0.110 | 0.000 | -0.000 |
+| 0.40 | 36.2% | 0.418 | 0.007 | +0.014 |
+| 0.10 | 10.4% | 0.583 | 0.937 | +0.024 |
+| 0.02 | 3.4% | 0.673 | 0.979 | +0.047 |
+
+Agreement tracks the fraction, which is exactly the identity `P(best child in a uniform
+k-subset) = k/n`. That is the sanity check on the sampler, and also the headline: **random
+subsetting buys nothing clever for a greedy player** -- keeping the best move with
+probability p costs p of the work. Departures from that line would be the interesting
+result, and there are none here.
+
+For a player that *samples*, the answer is the opposite. At T = 0.3 one child at +0.96
+against 400 near -0.05 still only draws ~7% of the softmax mass, so the policy rarely takes
+it and dropping it costs almost nothing: the policy loss stays under 0.05 even at 2% of the
+children. Which column matters depends entirely on the temperature the engine will run at.
+
+## Which temperature schedule gives better labels? (`nnplay variance`)
+
+A value head is trained on `(position, eventual outcome)`, and the outcome is partly set by
+the position and partly by the dice rolled after it. `variance` splits the two:
+
+```
+Var(z) = Var(E[z|s])  +  E[Var(z|s)]
+         signal          noise
+```
+
+It plays games under the given schedule, snapshots positions along the way, and replays
+each one `--branches K` times to the end. The spread within a snapshot's K outcomes is the
+noise; the spread of their means across snapshots, less `noise/K` of sampling error, is the
+signal. `signal / (signal + noise)` is the **achievable R2**: the most any value head could
+explain from that schedule's labels. It is a property of the schedule, not of how well the
+generating net happens to predict, which is why it can compare schedules where
+`corr(value, outcome)` on an ordinary corpus cannot -- a net trained on one schedule's games
+predicts that schedule best whatever its labels are worth.
+
+Snapshots are taken every `--branch-every N` plies from a random phase per game, so every
+ply is equally likely to be sampled and positions are weighted the way the corpus weights
+them.
+
+Use it through the sweep, which runs it per schedule and puts a bootstrap interval over
+games on every number. `variance_sweep_cell.py` is the same sweep as a single marimo cell
+to paste into a notebook where there is no shell; its settings are at the top. Locally:
+
+```
+python3 sweep_temperature.py --schedules 1.0:0:1.0,1.0:0:0.5,1.5:20:0.3 --games 400
+python3 sweep_temperature.py --mode variance --schedules 1.0:0:1.0,1.0:0:0.5,1.5:20:0.3 \
+                             --games 300 --dry-run
+```
+
+The play sweep comes first: variance mode reads each schedule's play shard to set the
+stride (mean game length over `--points-per-game`, default 8) and to estimate cost. Cost
+grows with game length squared -- each snapshot's playouts run to the end of the game --
+so read `--dry-run` before committing. On the T=1.0 production corpus it comes to ~21k
+plies per game at K=8, about 26 h for 300 games at 68 pos/s; halving K or the points per
+game halves that. `--reuse` resumes without redoing finished schedules, and `--jobs J`
+splits a schedule's games over J processes, which only pays if one leaves the GPU idle.
+
+The estimator was checked on synthetic outcomes with a known answer: true R2 0.213,
+estimated 0.2145 (sd 0.012 at 200 games), with the 95% interval covering the truth in
+192 of 200 trials, and the noise-corrected net correlation matching its true value to three
+places.
+
+## Which children get scored: the policy
+
+`play`, `elo` and `variance` no longer score a random slice of the children. Each ply the
+**policy graph** ranks every legal move from one pass over the parent, and the value head
+scores the policy's top `--policy-top` (default **5%**) plus `--policy-explore` (default
+**2%**) more drawn at random from the rest; the move is then sampled from those as before,
+with forced regicide and King safety unchanged. The random extras are the policy's
+blind-spot insurance: on held-out games it missed the value head's best child ~10% of the
+time even in its top half, and children it never ranks highly are only ever evaluated --
+and, with `--children`, recorded for the next policy to learn from -- if something other
+than the policy picks them.
+
+What it bought, measured on the policy before this was built: over every legal move of
+held-out positions, the top 5% held the value head's best child 78% of the time (random:
+5%) and gave up 0.013 of value against the best child, where a random 25% gives up 0.027 --
+half the loss at a fifth of the evaluations.
+
+The policy graph sits beside the value graph -- `net_fp16_policy.onnx` beside
+`net_fp16.onnx`, `--policy-model` to name another -- and `export_onnx.py` writes it for any
+`model_policy.py` checkpoint. **A model without one is refused** by `play`, `elo` and
+`variance`, and so is an `elo` baseline without one; `--baseline random` still works, and
+`eval`, `selfcheck` and `subsample` need only the value graph. `--subset-fraction` is gone
+and says so. `elo --vs-full` replaces its rating use: the net plays itself, one side pruning
+with the policy and the other scoring every child, which prices the pruning directly.
+
+`selfcheck` now verifies the policy move for move: every legal move of the start position
+goes through the C move generator, the rows nnplay builds and the policy graph, against the
+logits `export_onnx.py` computed in torch for the same moves (`policy_tolerance` in the
+manifest, 0.05; fp16 lands at ~0.006). The `.tkn` header records the settings (version 6:
+bits 8..15 and 16..31 of word 100, in thousandths), and the run summary prints the policy's
+share of the time.
+
+## Training the policy head (`--children`, `tkykids.c`, two notebook cells)
+
+`model_policy.py` adds a policy head: one forward pass over a position gives a logit for
+every legal move, and the aim is for those logits to rank children the way the value head
+would, so the search can evaluate only the policy's top few instead of hundreds.
+
+**`nnplay play --out X.tkn --children X.kids`** keeps what the policy learns from: at
+every ply, every child the search scored and the value it got. Nothing extra is computed;
+the values existed anyway. About 2 KB a position.
+
+    file header, 32 bytes: "TKYKIDS\0", u32 version 1, u32 header size 32, u32 child size 6,
+        u32 game header size 24, u64 games
+    per game, 24 bytes: u32 n_plies, u32 reserved, u64 seed, u64 FNV-1a 64 of the ply
+        records' move words -- (seed, n_plies, hash) finds the matching .tkn game
+    per ply: u16 n, then n x { u32 move (ply-record packing, absolute), f16 value }
+
+Ply k's children belong to the position before move k, i.e. record k-1's board. A value is
+for the side to move after that child, as the search saw it; the mover prefers low. A
+forced King capture is stored as its one child. Tar the `.kids` into the same `.tkn.tgz`.
+`merge_tkn.py` does not merge `.kids` files and warns when it meets one.
+
+**`tkykids.c`** is a small library over `tky.c` for archives with no `.kids`: legal moves
+and child boards from a stored board, called from Python through ctypes. It is checked
+against self-play: its move count equals the recorded `n_legal` at every position, every
+recorded child is one of its moves, and applying the played move reproduces the next
+record's board exactly. The training cell compiles it with gcc on first use.
+
+**`distill_value_cell.py`** (one global, `distilled`) trains the new model's value head to
+reproduce the old model's, on every position in the `*.tkn.tgz` archives in its directory.
+It warm-starts from `checkpoint.pt`: every tensor whose name and shape match is copied, the
+old `conv_stem` mapping onto `conv_norm`/`conv_down`; the feed-forward layers (2048 wide
+before, 512 now) start fresh with their output layer zeroed, so the student begins as the
+teacher minus those blocks rather than as noise -- 0.74 correlation before any training.
+It writes `checkpoint_policy.pt`.
+
+**`train_policy_cell.py`** (one global, `policy_training`) trains value and policy
+together. The value target is `engine_marimo.py`'s TD(lambda), unchanged. The policy target
+is the search's own distribution, `softmax(-child value / 0.3)`, against the policy's
+softmax over the same children: recorded children with their recorded values where a
+`.kids` exists, otherwise 16 legal moves drawn here and scored by the model's own value
+head. Archives are unpacked once into `tkn_cache/` and memory-mapped, so memory does not
+grow with the corpus: a 1M-position archive indexes in 2 s at ~4 GB resident.
+
+It reads every `*.tkn.tgz` in its directory and every bare `.tkn` beside them (with a
+`.kids` next to it, if any). A game present twice -- an archive beside its own unpacked
+`.tkn`, a merged file beside its sources -- is counted once, matched by seed, length and
+move sequence.
+
+Its report, on held-out games, ranks each position's children by policy and asks what the
+search would get evaluating only the policy's top 5/10/25/50%: whether the value head's
+best child is in there, how much of the target softmax is, and how much value is given up
+against the best child -- each beside what a random pick of the same size would get (the
+random value loss computed exactly, not sampled), with the median child's gap to the best
+for scale. A second report does the same over **every legal move** of 200 held-out
+positions, scored by the model's own value head, at the start, every 2500 steps and at the
+end; that is the one that says how far the search could be cut. Read the ideal-ordering row
+first: if it is barely above random, the value head rates the children nearly alike at this
+temperature and no ordering can concentrate much there.
 
 ## Is the GPU actually busy? (`--stats`)
 
@@ -776,16 +1125,20 @@ threads, so a million positions is well under a minute of CPU.
 ## Corpus format (`.tkn`)
 
 Little-endian, fixed strides. Same 128-byte header style as `.tky`, magic `TKYNNSP`;
-offset 56 holds the temperature as a double, 96 the sub-batch used, 104..127 the model
-file name. Then, per game, a 16-byte header and one record per ply.
+offset 32 holds the base seed -- drawn fresh every run unless `--seed` is given, because a
+fixed default made separate sessions replay each other's games -- 56 the temperature as a
+double, 80 the rules (bit 0 forced regicide; from
+version 3 bit 1 King safety; from version 4 bit 2 ply cap scored on material, bits 8..23
+the resignation lead in pawns, 0 off, and bits 24..31 the plies it must hold), 96 the
+sub-batch used, 104..127 the model file name. Then, per game, a 16-byte header and one record per ply.
 
 ### Per game, 16 bytes
 
 | off | type | field |
 |---|---|---|
 | 0 | u32 | `n_plies` |
-| 4 | i8 | result: **1 black, -1 white, 0** any draw or ply cap |
-| 5 | u8 | termination: 0 royal capture, 1 stalemate, 2 repetition, 3 no progress, 4 ply cap |
+| 4 | i8 | result: **1 black, -1 white, 0** draw. From version 4 a resignation goes to the side ahead on material, and so does a ply cap -- from version 5 only at a lead of 50 pawns or more |
+| 5 | u8 | termination: 0 royal capture, 1 stalemate, 2 repetition, 3 no progress, 4 ply cap, 5 resignation |
 | 6 | u16 | flags (reserved) |
 | 8 | u64 | seed |
 
@@ -799,7 +1152,7 @@ file name. Then, per game, a 16-byte header and one record per ply.
 | 2600 | u16 | legal moves the mover chose from |
 | 2602 | i16 | material after the move, black minus white, `mat_shift` units |
 | 2604 | u8 | the mover: 1 black, 0 white |
-| 2605 | u8 | flags: 1 capture, 2 promotion, 4 forced King capture, 8 last ply of the game |
+| 2605 | u8 | flags: 1 capture, 2 promotion, 4 forced King capture, 8 last ply of the game, 16 King safety changed the pick, 32 played by the `elo` opponent |
 | 2606 | u16 | reserved |
 
 Unlike `.tky` this stores boards, not just moves, because that is what the request asked
@@ -848,35 +1201,60 @@ rewritten into the same frame; `result_black` and `side_black` keep the absolute
 
 ## Running it somewhere else
 
-`./bundle.sh DIR` assembles the smallest tree that plays self-play on another machine --
-a notebook, a rented GPU box. **13 MB, ten files, no node, no torch and no
-`checkpoint.pt` on the far end**, because the rules are already baked into `tables.h` and
-the weights into `net_fp16.onnx`:
+`./bundle.sh DIR` assembles a directory with one entry point. Upload it, run `setup.sh`
+once, use `nnplay`. The bundle is ~13 MB and carries no runtime; `setup.sh` downloads that.
 
-| file | why |
-|---|---|
-| `nnplay.c`, `tky.c`, `tables.h` | the whole rules and self-play stack; `nnplay.c` includes the other two |
-| `onnxruntime_c_api.h` | the only header needed, and it pulls in nothing but libc |
-| `net_fp16.onnx` | the weights, already fused |
-| `unpack.py`, `unpack_nn.py`, `tables.json` | reading the `.tkn` back |
-| `setup.sh`, `README.md` | generated: the pip line and the exact gcc line |
+```
+sh setup.sh [PYTHON]     # PYTHON only downloads things; nothing is installed into it
+```
 
-The 258 MB C API tarball is **not** needed there. `pip install onnxruntime-gpu` ships
-`libonnxruntime.so` and the CUDA provider in the wheel, so the only thing missing from pip
-is the header, which the bundle carries. `setup.sh` does the pip install, links the two
-SONAME aliases the wheel does not provide, and compiles.
+It installs `onnxruntime-gpu` with `pip --target` into the bundle's own **`ortlib/`**,
+compiles, and then proves the result: the CUDA provider loads, the start position
+evaluates to the value `export_onnx.py` recorded in `net_manifest.json`, and the probe
+prints this GPU's throughput. It stops with the reason if any of that fails, and is safe
+to re-run. Measured end to end from a clean bundle: 1m40s including the download.
 
-The pip version must match the one the graphs were fused with -- `bundle.sh` reads it from
-`third_party/onnxruntime/VERSION_NUMBER` and writes it into the generated `setup.sh` --
-because `com.microsoft.Attention` is a contrib op and only the runtime that defines it is
-guaranteed to load it. Add `--with-export` (+75 MB, adds `checkpoint.pt` and the export
-scripts) to re-export on the far end instead, and `--with-tests` for `test_nnplay.py` and
-the corpus shard its encode and torch checks read. `--with-fp32` adds the 25 MB fp32 graph,
-which only earns its place for the `--no-tf32` parity check.
+**Why a private directory.** `onnxruntime` and `onnxruntime-gpu` install into the *same*
+package directory, so whichever went in last wins -- and a notebook package manager
+(marimo's sandbox among them) installs the CPU wheel whenever a cell does
+`import onnxruntime`. Three separate sessions were lost to the GPU runtime being silently
+replaced that way. Nothing in `ortlib/` is visible to a package manager, and the binary
+finds it through `-Wl,-rpath,'$ORIGIN/ortlib/onnxruntime/capi'`, relative to itself.
 
-Without a working CUDA provider `nnplay` warns and runs on the CPU rather than dying --
-verified by building the bundle against the CPU-only wheel -- but it is ~100x slower there
-and not worth starting.
+Consequences worth knowing:
+
+* the runtime version is whatever `ORT_SPEC` resolves to (default `onnxruntime-gpu>=1.22`);
+  pin it when the driver is older than the newest wheel's CUDA, e.g.
+  `ORT_SPEC='onnxruntime-gpu==1.20.2' sh setup.sh`;
+* only the **header** is shipped. The C API is versioned inside it and newer runtimes still
+  serve older API versions, so one header works with whatever gets downloaded;
+* the SONAME aliases are made **inside** `ortlib/.../capi`, beside the provider libraries.
+  ONNX Runtime loads its providers from the directory its own `libonnxruntime` came from,
+  so aliasing it into the bundle directory instead produces
+  `Failed to load library .../libonnxruntime_providers_shared.so`;
+* CUDA libraries are found by asking several interpreters for `nvidia.__path__` and by
+  globbing the usual site-packages and `/usr/local/cuda` locations, then baked in as
+  `DT_RPATH` -- not `DT_RUNPATH`, because the provider is `dlopen`ed by `libonnxruntime.so`
+  and only `DT_RPATH` is inherited that far. No `LD_LIBRARY_PATH` at run time.
+
+**`nnplay` refuses to run on the CPU** unless given `--allow-cpu`. A silent fallback is
+~100x slower, looks like a hang, and was twice mistaken for a working setup. The error
+names the cause: a CPU-only wheel, a driver older than the runtime's CUDA, or a missing
+library, which `setup.sh` then lists via `ldd`.
+
+`nnplay selfcheck` is the same check on demand, in pure C -- no Python, numpy or
+`unpack.py` needed on the far end. The bundle's own `README.md` carries the notebook cells.
+
+### The exporter reads the architecture, it does not assume it
+
+`export_rewrite.py` takes the head count and width off the layer
+(`self_attn.num_heads`, `embed_dim`) and `export_onnx.py` passes those to the fusion.
+Hardcoding them is not a style problem: splitting a 128-wide layer into 8 heads instead of
+4 is still a valid tensor program, just not this network, and the only symptom was the
+export check drifting to `max|dv| = 0.09` -- which looks like a tolerance that wants
+widening. Reading the shape put it back to `1.9e-07`. The export prints what it found
+(`encoder: 3 layers, 4 heads, d_model 128`); if that line does not match `model.py`,
+nothing downstream is measuring the network you trained.
 
 ## Getting the runtime
 

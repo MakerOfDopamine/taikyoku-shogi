@@ -35,6 +35,11 @@ step "optimised engine vs straight transliteration"
 step "forced King capture: fast detector vs reference, cache, and the rule itself"
 ./tky kingtest 200; ok $?
 
+if [ -x ./nnplay ]; then
+    step "nnplay King safety: exact vs the slow detector, the sweep, the sampling distribution"
+    ./nnplay safetytest; ok $?
+fi
+
 step "corpus round trip: python reader rebuilds the engine's board every ply"
 for s in 1 2 3; do ./tky trace $s 600 > "$SC/r$s.txt"; done
 python3 - "$SC"/r1.txt "$SC"/r2.txt "$SC"/r3.txt <<'PY'

@@ -38,11 +38,12 @@ GAME_HDR = 16
 BOARD_BYTES = NSQ * 2
 REC = BOARD_BYTES + 16
 
-PF_CAPTURE, PF_PROMOTION, PF_FORCED_KING, PF_TERMINAL = 1, 2, 4, 8
+PF_CAPTURE, PF_PROMOTION, PF_FORCED_KING, PF_TERMINAL, PF_KING_SAFETY, PF_OPPONENT = \
+    1, 2, 4, 8, 16, 32
 
 REC_DTYPE = np.dtype([("board", "<u2", (NSQ,)), ("move", "<u4"), ("value", "<f4"),
                       ("n_legal", "<u2"), ("material", "<i2"), ("side", "u1"),
-                      ("flags", "u1"), ("pad", "<u2")])
+                      ("flags", "u1"), ("n_scored", "<u2")])
 assert REC_DTYPE.itemsize == REC, REC_DTYPE.itemsize
 
 
@@ -65,6 +66,15 @@ class Header:
     model: str            # "<graph>@<hash>" -- the hash identifies the weights, not the name
     mat_shift: int
     value_fp: int
+    opening_plies: int = 0
+    opening_temperature: float | None = None
+    king_safety: int = 0      # version 3 on: never left its own King capturable if avoidable
+    cap_by_material: int = 0  # version 4 on: the ply cap went to the side ahead on material
+    cap_draw_margin: int | None = None   # ... unless within this many pawns: 0 in v4, 50 from v5
+    resign_lead: int = 0      # version 4 on: a lead of this many pawns ... (0 off)
+    resign_plies: int = 0     # ... held this many plies ended the game
+    policy_top: float | None = None      # version 6 on: the value head scored the policy's top
+    policy_explore: float | None = None  # this much of the moves, plus this much at random
 
 
 @dataclass
@@ -80,11 +90,14 @@ class NNInfo:
     move: dict               # special, origin, target of the move that produced this board
     value: float             # the network's value of this board, in its side-to-move frame
     n_legal: int             # legal moves the mover chose from
+    n_scored: int            # children actually evaluated (== n_legal unless --subset-fraction)
     material: float          # pawns, black minus white (side to move minus opponent if canonical)
     result: int              # 1 the side to move won, -1 lost, 0 draw (absolute: 1 = black)
     result_black: int        # always absolute: 1 black won, -1 white won, 0 draw
     termination: str
     forced_king_capture: bool
+    king_safety_override: bool   # the rule changed the pick on this ply
+    opponent_move: bool          # nnplay elo --out: the baseline or random mover played it
     was_capture: bool
     was_promotion: bool
     canonical: bool
@@ -126,8 +139,19 @@ def read_header(f) -> Header:
     return Header(version=u32(8), seed_base=u64(32), games=u64(40), plies=u64(48),
                   temperature=struct.unpack_from("<d", raw, 56)[0],
                   max_plies=u32(64), rep_limit=u32(68), no_progress_limit=u32(72),
-                  stalemate_loses=u32(76), regicide=u32(80), board_size=u32(84),
-                  piece_types=u32(88), sub_batch=u32(96), fp16=u32(100),
+                  stalemate_loses=u32(76), regicide=u32(80) & 1, board_size=u32(84),
+                  king_safety=(u32(80) >> 1) & 1 if u32(8) >= 3 else 0,
+                  cap_by_material=(u32(80) >> 2) & 1 if u32(8) >= 4 else 0,
+                  cap_draw_margin=((50 if u32(8) >= 5 else 0)
+                                   if u32(8) >= 4 and (u32(80) >> 2) & 1 else None),
+                  resign_lead=(u32(80) >> 8) & 0xFFFF if u32(8) >= 4 else 0,
+                  resign_plies=u32(80) >> 24 if u32(8) >= 4 else 0,
+                  piece_types=u32(88), sub_batch=u32(96), fp16=u32(100) & 1,
+                  policy_top=(u32(100) >> 16) / 1000 if u32(8) >= 6 else None,
+                  policy_explore=((u32(100) >> 8) & 0xFF) / 1000 if u32(8) >= 6 else None,
+                  opening_plies=struct.unpack_from("<H", raw, 92)[0] if u32(8) >= 2 else 0,
+                  opening_temperature=(struct.unpack_from("<H", raw, 94)[0] / 1000.0
+                                       if u32(8) >= 2 else None),
                   model=raw[104:128].split(b"\x00")[0].decode(), mat_shift=u32(28),
                   value_fp=u32(24))
 
@@ -189,10 +213,14 @@ def unpack_nn(path: str, canonical: bool = True, terminal_only: bool = False,
                         side=int(r["side"]), side_black=int(r["side"]),
                         move={k: unpack_move(int(r["move"]))[k] for k in ("special", "origin", "target")},
                         value=float(r["value"]), n_legal=int(r["n_legal"]),
+                        # 0 was the reserved pad in files written before --subset-fraction
+                        n_scored=int(r["n_scored"]) or int(r["n_legal"]),
                         material=float(r["material"]) / (1 << hdr.mat_shift),
                         result=int(result), result_black=int(result),
                         termination=TERM_NAMES[term],
                         forced_king_capture=bool(r["flags"] & PF_FORCED_KING),
+                        king_safety_override=bool(r["flags"] & PF_KING_SAFETY),
+                        opponent_move=bool(r["flags"] & PF_OPPONENT),
                         was_capture=bool(r["flags"] & PF_CAPTURE),
                         was_promotion=bool(r["flags"] & PF_PROMOTION),
                         canonical=False)

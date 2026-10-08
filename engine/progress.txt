@@ -1,0 +1,69 @@
+450K positions total:
+200 games, 73625 plies (368/game), 45.9 min
+  as black : 56W 44L 0D
+  as white : 63W 37L 0D
+  overall  : 119W 81L 0D   score 0.5950
+  Elo +68, 95% credible interval [+18, +117]   (baseline_fp16.onnx = 0)
+
+1.35M positions total:
+200 games, 46065 plies (230/game), 28.7 min
+  as black : 58W 42L 0D
+  as white : 65W 35L 0D
+  overall  : 123W 77L 0D   score 0.6150
+  Elo +82, 95% credible interval [+32, +132]   (baseline_fp16.onnx = 0)
+200 games, 46665 plies (233/game), 28.8 min
+  as black : 69W 31L 0D
+  as white : 70W 30L 0D
+  overall  : 139W 61L 0D   score 0.6950
+  Elo +144, 95% credible interval [+92, +197]   (baseline_fp16.onnx = 0)
+
+2.25M positions total:
+200 games, 20479 plies (102/game), 12.1 min
+  as black : 68W 32L 0D
+  as white : 51W 49L 0D
+  overall  : 119W 81L 0D   score 0.5950
+  Elo +69, 95% credible interval [+19, +119]   (baseline_fp16.onnx = 0)
+  draw rating 0, first-move advantage +63
+200 games, 32413 plies (162/game), 18.7 min
+  as black : 84W 16L 0D
+  as white : 75W 25L 0D
+  overall  : 159W 41L 0D   score 0.7950
+  Elo +242, 95% credible interval [+182, +306]   (baseline_fp16.onnx = 0)
+  draw rating 1, first-move advantage +50
+
+3M positions total:
+200 games, 21873 plies (109/game), 13.4 min
+  as black : 58W 42L 0D
+  as white : 67W 33L 0D
+  overall  : 125W 75L 0D   score 0.6250
+  Elo +90, 95% credible interval [+40, +140]   (baseline_fp16.onnx = 0)
+  draw rating 0, first-move advantage -34
+200 games, 29389 plies (147/game), 17.7 min
+  as black : 83W 17L 0D
+  as white : 84W 16L 0D
+  overall  : 167W 33L 0D   score 0.8350
+  Elo +285, 95% credible interval [+222, +354]   (baseline_fp16.onnx = 0)
+  draw rating 1, first-move advantage -6
+
+5M positions total:
+200 games, 19271 plies (96/game), 10.6 min
+  as black : 50W 50L 0D
+  as white : 63W 37L 0D
+  overall  : 113W 87L 0D   score 0.5650
+  Elo +47, 95% credible interval [-3, +95]   (baseline_fp16.onnx = 0)
+  draw rating 0, first-move advantage -47
+
+----------------------------------------------------------------
+NEW:
+Generation 0 (random): 35a221a4
+Generation 1         : b3118b47 
+200 games, 212578 plies (1063/game), 148.5 min
+  as black : 55W 40L 5D
+  as white : 56W 42L 2D
+  overall  : 111W 82L 7D   score 0.5725
+  Elo +51, 95% credible interval [+3, +99]   (baseline_fp16.onnx = 0)
+  draw rating 14, first-move advantage +1
+  king safety changed the pick on 2225 plies (1.05%), both sides
+
+Generation 2         : b0414eb0
+

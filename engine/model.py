@@ -7,7 +7,6 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-
 class TaikyokuShogiBot(nn.Module):
     def __init__(self, size = 36, piece_types = 301):
         # TODO add size parameters or something
@@ -22,27 +21,24 @@ class TaikyokuShogiBot(nn.Module):
         # View:  (B, 64, 36, 36)
 
         self.conv_stem = nn.Sequential(
-            nn.Conv2d(in_channels=64, out_channels=128, kernel_size=3, padding=1),  # Shape: (B, 128, 36, 36)
-            nn.GroupNorm(8, 128),
+            nn.Conv2d(in_channels=64, out_channels=96, kernel_size=3, padding=1),  # Shape: (B, 96, 36, 36)
+            nn.GroupNorm(12, 96),
             nn.ReLU(),
-            nn.Conv2d(in_channels=128, out_channels=192, kernel_size=3, padding=1), # Shape: (B, 192, 36, 36)
-            nn.GroupNorm(8, 192),
+            nn.Conv2d(in_channels=96, out_channels=128, kernel_size=3, padding=1, stride=2), # Shape: (B, 128, 18, 18)
+            nn.GroupNorm(16, 128),
             nn.ReLU(),
-            nn.Conv2d(in_channels=192, out_channels=256, kernel_size=3, padding=1), # Shape: (B, 256, 36, 36)
-            nn.GroupNorm(8, 256),
-            nn.ReLU()
         )
-        # Shape: (B, 256, 36, 36)
-        # View:  (B, 256, 1296)
-        # Trans: (B, 1296, 256)
+        # Shape: (B, 128, 18, 18)
+        # View:  (B, 128, 324)
+        # Trans: (B, 324, 128)
 
-        self.pos = nn.Parameter(torch.randn((1, size ** 2, 256)) * 0.02)
-        self.transformers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=256, nhead=8, activation='gelu', batch_first=True, norm_first=True), num_layers=4)
-        # Shape: (B, 1296, 256)
-        # Mean:  (B, 256)
-        self.lin_shared = nn.Linear(256, 256)
-        self.lin_value = nn.Linear(256, 1)
-        self.lin_material = nn.Linear(256, 1)
+        self.pos = nn.Parameter(torch.randn((1, (size ** 2) // 4, 128)) * 0.02)
+        self.transformers = nn.TransformerEncoder(nn.TransformerEncoderLayer(d_model=128, nhead=4, activation='gelu', batch_first=True, norm_first=True), num_layers=3)
+        # Shape: (B, 324, 128)
+        # Mean:  (B, 128)
+        self.lin_shared = nn.Linear(128, 128)
+        self.lin_value = nn.Linear(128, 1)
+        self.lin_material = nn.Linear(128, 1)
 
     def forward(self, x):
         BATCH_SIZE = x.shape[0]
@@ -53,7 +49,7 @@ class TaikyokuShogiBot(nn.Module):
         x = x.reshape((BATCH_SIZE, 64, self.size, self.size))
         x = self.conv_stem(x)
 
-        x = x.reshape((BATCH_SIZE, 256, self.size ** 2))
+        x = x.reshape((BATCH_SIZE, 128, (self.size ** 2) // 4))
         x = x.transpose(1, 2)
         x = x + self.pos
         x = self.transformers(x)

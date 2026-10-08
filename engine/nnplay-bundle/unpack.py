@@ -62,7 +62,8 @@ DIRX = (1, 1, 0, -1, -1, -1, 0, 1)
 DIRY = (0, 1, 1, 1, 0, -1, -1, -1)
 
 RESULT_NAMES = ("white", "black", "draw")
-TERM_NAMES = ("royal_capture", "stalemate", "repetition", "no_progress", "ply_cap")
+TERM_NAMES = ("royal_capture", "stalemate", "repetition", "no_progress", "ply_cap",
+              "resignation")
 
 MAGIC_GAMES = b"TKYSHOGI"
 MAGIC_POSITIONS = b"TKYPOSNS"

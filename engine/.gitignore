@@ -1,0 +1,16 @@
+tky
+nnplay
+tky_ref
+samples.bin
+movestats.bin
+selection_bins.csv
+__pycache__/
+*.tky
+*.tkp
+third_party/
+*.onnx
+*.tkn
+net_manifest.json
+*.pt
+*.csv
+*.tkn.tgz

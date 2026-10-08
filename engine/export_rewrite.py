@@ -17,11 +17,15 @@ import torch.nn as nn
 class BertShapedLayer(nn.Module):
     """One norm_first TransformerEncoderLayer, written out as separate q/k/v projections."""
 
-    def __init__(self, layer: nn.TransformerEncoderLayer, nhead: int):
+    def __init__(self, layer: nn.TransformerEncoderLayer):
         super().__init__()
         mha = layer.self_attn
-        e = mha.embed_dim
-        self.h, self.d = nhead, e // nhead
+        # Read the shape off the layer. Hardcoding it silently computes a *different*
+        # attention when the model changes -- 8 heads over a 128-dim layer instead of 4 is
+        # still a valid tensor program, just not this network, and it showed up only as a
+        # 0.09 deviation in the export check.
+        e, self.h = mha.embed_dim, mha.num_heads
+        self.d = e // self.h
         self.q, self.k, self.v = (nn.Linear(e, e) for _ in range(3))
         for i, lin in enumerate((self.q, self.k, self.v)):
             lin.weight = nn.Parameter(mha.in_proj_weight[i * e:(i + 1) * e].clone())
@@ -44,7 +48,13 @@ class BertShapedLayer(nn.Module):
         return x + self.lin2(torch.nn.functional.gelu(self.lin1(y)))
 
 
-def rewrite(net, nhead=8):
+def attention_shape(net):
+    """(num_heads, embed_dim) of the encoder, for the offline fusion pass."""
+    mha = net.transformers.layers[0].self_attn
+    return mha.num_heads, mha.embed_dim
+
+
+def rewrite(net):
     """In place on a copy of the network: swap every encoder layer for the BERT-shaped one."""
-    net.transformers = nn.Sequential(*[BertShapedLayer(l, nhead) for l in net.transformers.layers])
+    net.transformers = nn.Sequential(*[BertShapedLayer(l) for l in net.transformers.layers])
     return net
