@@ -2,15 +2,16 @@
  *
  * The rules, the move generator and the move executor are tky.c's, included wholesale so
  * there is exactly one copy of game.js's semantics in this directory. This file adds the
- * policy: at every ply, evaluate the position *after* every legal move with the network
- * and sample the move from a softmax over the negated leaf values.
+ * players: a PUCT search over the network's policy priors and value head, run for many
+ * games in lockstep so their leaves share GPU calls, and the older one-ply search (--sims
+ * 0), which scores the children of the policy's top moves and samples from a softmax over
+ * their values.
  *
  * Perspective. Everything the network sees is in the frame of whoever is to move in that
  * position, which is the canonicalisation unpack.canonical_board performs: black to move
  * is the board as stored, white to move is rotated 180 degrees with every colour bit
  * flipped. That is exact, not approximate -- see CLAUDE.md section 13. A child position is
- * therefore encoded for the *opponent*, so its value is the opponent's, and the policy
- * softmaxes the negation.
+ * therefore encoded for the *opponent*, so its value is the opponent's.
  *
  * Inference is ONNX Runtime's C API on the CUDA execution provider. The sub-batch size is
  * measured on the GPU actually present at startup rather than assumed.
@@ -19,6 +20,7 @@
 #include "tky.c"
 
 #include <dlfcn.h>
+#include <pthread.h>
 #include <sys/random.h>
 
 #include "onnxruntime_c_api.h"
@@ -49,15 +51,19 @@ static const OrtApi *ort = NULL;
         if (st_) { fprintf(stderr, "onnxruntime: %s\n", ort->GetErrorMessage(st_)); \
                    ort->ReleaseStatus(st_); exit(1); } } while (0)
 
+/* The model graph, value and policy heads over one pass of the trunk (export_onnx.py):
+ *   board  int32 (B, 1296) -> value  (B,)  for each board's side to move
+ *   moves  int32 (M, 4)    -> logits (M,)  rows (board row, from, to, special), each in
+ *                                          its own board's canonical frame */
 typedef struct {
     OrtEnv           *env;
     OrtSessionOptions*opts;
     OrtSession       *sess;
     OrtMemoryInfo    *meminfo;
-    const char       *in_name, *out_name[2];
-    char             *in_name_owned, *out_name_owned[2];
     OrtAllocator     *alloc;
-    int               fp16_out;    /* the value output comes back as float16 */
+    const char       *in_name[2], *out_name[2];   /* [0] board / value, [1] moves / logits */
+    char             *owned[4];
+    int               fp16[2];     /* value, logits come back as float16 */
     int               on_cuda;     /* the CUDA provider was actually enabled */
     int32_t          *probe_buf;   /* scratch boards for the startup probe only */
     int               sub_batch;
@@ -103,31 +109,43 @@ static uint16_t float_to_half(float f)
     return (uint16_t)(sign | h);
 }
 
-/* Runs `nb` boards from `src`, writing nb values to `dst`. Returns an OrtStatus rather
- * than exiting so the startup probe can see OOM. `src` is borrowed, not copied. */
-static OrtStatus *net_run_raw(Net *n, const int32_t *src, int nb, float *dst)
+/* One call: nb boards and nr move rows in, nb values and nr logits out (logits NULL
+ * drops them). Returns an OrtStatus rather than exiting so the startup probe can see OOM.
+ * The inputs are borrowed, not copied. */
+static OrtStatus *net_run_raw(Net *n, const int32_t *boards, int nb, const int32_t *rows,
+                              int nr, float *values, float *logits)
 {
-    int64_t shape[2] = { nb, NSQ };
-    OrtValue *in = NULL, *out[2] = { NULL, NULL };
-
+    int64_t bs[2] = { nb, NSQ }, ms[2] = { nr, 4 };
+    OrtValue *in[2] = { NULL, NULL }, *out[2] = { NULL, NULL };
     OrtStatus *st = ort->CreateTensorWithDataAsOrtValue(
-            n->meminfo, (void *)src, (size_t)nb * NSQ * sizeof(int32_t),
-            shape, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &in);
-    if (st) return st;
-
-    st = ort->Run(n->sess, NULL, &n->in_name, (const OrtValue *const *)&in, 1, n->out_name, 1, out);
-    ort->ReleaseValue(in);
-    if (!st) {
+            n->meminfo, (void *)boards, (size_t)nb * NSQ * sizeof(int32_t),
+            bs, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &in[0]);
+    if (!st) st = ort->CreateTensorWithDataAsOrtValue(
+            n->meminfo, (void *)rows, (size_t)nr * 4 * sizeof(int32_t),
+            ms, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &in[1]);
+    if (!st) st = ort->Run(n->sess, NULL, n->in_name, (const OrtValue *const *)in, 2,
+                           n->out_name, 2, out);
+    float *dst[2] = { values, logits };
+    int cnt[2] = { nb, nr };
+    for (int k = 0; k < 2 && !st; k++) {
         void *raw = NULL;
-        st = ort->GetTensorMutableData(out[0], &raw);
-        if (!st) {
-            if (n->fp16_out) { const uint16_t *h = (const uint16_t *)raw;
-                               for (int i = 0; i < nb; i++) dst[i] = half_to_float(h[i]); }
-            else             { memcpy(dst, raw, (size_t)nb * sizeof(float)); }
-        }
+        if (!dst[k] || (st = ort->GetTensorMutableData(out[k], &raw))) continue;
+        if (n->fp16[k]) { const uint16_t *h = (const uint16_t *)raw;
+                          for (int i = 0; i < cnt[k]; i++) dst[k][i] = half_to_float(h[i]); }
+        else            memcpy(dst[k], raw, (size_t)cnt[k] * sizeof(float));
     }
-    for (int i = 0; i < 2; i++) if (out[i]) ort->ReleaseValue(out[i]);
+    for (int k = 0; k < 2; k++) {
+        if (in[k]) ort->ReleaseValue(in[k]);
+        if (out[k]) ort->ReleaseValue(out[k]);
+    }
     return st;
+}
+
+/* Values only. The moves input cannot be empty, so one dummy row rides along. */
+static const int32_t NO_MOVE[4] = { 0, 0, 0, 0 };
+static OrtStatus *net_values_raw(Net *n, const int32_t *boards, int nb, float *values)
+{
+    return net_run_raw(n, boards, nb, NO_MOVE, 1, values, NULL);
 }
 
 /* Evaluates `nboards` boards laid out contiguously in `boards`, sub-batching. */
@@ -136,7 +154,7 @@ static void net_eval(Net *n, const int32_t *boards, int nboards, float *values)
     for (int at = 0; at < nboards; ) {
         int nb = nboards - at;
         if (nb > n->sub_batch) nb = n->sub_batch;
-        ORT_CHECK(net_run_raw(n, boards + (size_t)at * NSQ, nb, values + at));
+        ORT_CHECK(net_values_raw(n, boards + (size_t)at * NSQ, nb, values + at));
         at += nb;
     }
 }
@@ -216,7 +234,7 @@ static int net_probe(Net *n, int cap, int reps, int verbose)
          * times the steady-state cost. Measuring it made the probe stop at sub-batch 4 on
          * a card that wanted a far bigger one. */
         OrtStatus *st = NULL;
-        for (int w = 0; w < 2 && !st; w++) st = net_run_raw(n, n->probe_buf, b, tmp);
+        for (int w = 0; w < 2 && !st; w++) st = net_values_raw(n, n->probe_buf, b, tmp);
         if (st) {
             if (verbose) fprintf(stderr, "  sub-batch %5d : %s\n", b, ort->GetErrorMessage(st));
             ort->ReleaseStatus(st); free(tmp);
@@ -233,7 +251,7 @@ static int net_probe(Net *n, int cap, int reps, int verbose)
         while (r < 32 && (r < reps || now_s() - t_start < MEAS_S)) {
             for (size_t i = 0; i < (size_t)b * NSQ; i++) n->probe_buf[i] = (int32_t)((i + r) % NN_EMBED);
             double t0 = now_s();
-            st = net_run_raw(n, n->probe_buf, b, tmp);
+            st = net_values_raw(n, n->probe_buf, b, tmp);
             double dt1 = now_s() - t0;
             if (st) break;
             ts[r++] = dt1;
@@ -350,31 +368,33 @@ static void net_open(Net *n, const char *model, int device_id, int sub_batch,
     size_t nin = 0, nout = 0;
     ORT_CHECK(ort->SessionGetInputCount(n->sess, &nin));
     ORT_CHECK(ort->SessionGetOutputCount(n->sess, &nout));
-    /* value, plus material from the legacy model; only value is read */
-    if (nin != 1 || nout < 1 || nout > 2) {
-        fprintf(stderr, "model must have 1 input and 1-2 outputs (value[, material]); got %zu/%zu\n", nin, nout);
+    if (nin != 2 || nout != 2) {
+        fprintf(stderr, "%s: the model graph takes (board, moves) and returns (value, logits); this "
+                        "one has %zu inputs and %zu outputs.\n  A value-only graph beside a "
+                        "_policy.onnx is the old export: re-run export_onnx.py.\n", model, nin, nout);
         exit(1);
     }
-    ORT_CHECK(ort->SessionGetInputName(n->sess, 0, n->alloc, &n->in_name_owned));
-    n->in_name = n->in_name_owned;
-    for (int i = 0; i < (int)nout; i++) {
-        ORT_CHECK(ort->SessionGetOutputName(n->sess, i, n->alloc, &n->out_name_owned[i]));
-        n->out_name[i] = n->out_name_owned[i];
+    for (int k = 0; k < 2; k++) {
+        ORT_CHECK(ort->SessionGetInputName(n->sess, (size_t)k, n->alloc, &n->owned[k]));
+        ORT_CHECK(ort->SessionGetOutputName(n->sess, (size_t)k, n->alloc, &n->owned[2 + k]));
     }
-
-    OrtTypeInfo *ti = NULL;
-    const OrtTensorTypeAndShapeInfo *tsi = NULL;
-    ONNXTensorElementDataType et;
-    ORT_CHECK(ort->SessionGetOutputTypeInfo(n->sess, 0, &ti));
-    ORT_CHECK(ort->CastTypeInfoToTensorInfo(ti, &tsi));
-    ORT_CHECK(ort->GetTensorElementType(tsi, &et));
-    n->fp16_out = (et == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
-    ort->ReleaseTypeInfo(ti);
-
+    int si = !strcmp(n->owned[0], "moves"), so = !strcmp(n->owned[2], "logits");
+    n->in_name[0] = n->owned[si];      n->in_name[1] = n->owned[1 - si];
+    n->out_name[0] = n->owned[2 + so]; n->out_name[1] = n->owned[3 - so];
+    for (int k = 0; k < 2; k++) {
+        OrtTypeInfo *ti = NULL;
+        const OrtTensorTypeAndShapeInfo *tsi = NULL;
+        ONNXTensorElementDataType et;
+        ORT_CHECK(ort->SessionGetOutputTypeInfo(n->sess, (size_t)(k ^ so), &ti));
+        ORT_CHECK(ort->CastTypeInfoToTensorInfo(ti, &tsi));
+        ORT_CHECK(ort->GetTensorElementType(tsi, &et));
+        n->fp16[k] = et == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16;
+        ort->ReleaseTypeInfo(ti);
+    }
     if (verbose)
-        fprintf(stderr, "model %s (hash %08x): input '%s', output '%s'%s, value is %s\n",
-                model, hash_file(model), n->in_name, n->out_name[0],
-                nout > 1 ? " (+ material, unused)" : "", n->fp16_out ? "float16" : "float32");
+        fprintf(stderr, "model %s (hash %08x): inputs '%s','%s', outputs '%s','%s', %s\n",
+                model, hash_file(model), n->in_name[0], n->in_name[1], n->out_name[0],
+                n->out_name[1], n->fp16[0] ? "float16" : "float32");
 
     n->sub_batch = sub_batch > 0 ? sub_batch : net_probe(n, probe_cap, 3, verbose);
     free(n->probe_buf);
@@ -383,101 +403,13 @@ static void net_open(Net *n, const char *model, int device_id, int sub_batch,
 
 static void net_close(Net *n)
 {
-    for (int i = 0; i < 2; i++)
-        if (n->out_name_owned[i]) { OrtStatus *st = ort->AllocatorFree(n->alloc, n->out_name_owned[i]); if (st) ort->ReleaseStatus(st); }
-    if (n->in_name_owned) { OrtStatus *st = ort->AllocatorFree(n->alloc, n->in_name_owned); if (st) ort->ReleaseStatus(st); }
+    for (int i = 0; i < 4; i++)
+        if (n->owned[i]) { OrtStatus *st = ort->AllocatorFree(n->alloc, n->owned[i]); if (st) ort->ReleaseStatus(st); }
     if (n->meminfo) ort->ReleaseMemoryInfo(n->meminfo);
     if (n->sess) ort->ReleaseSession(n->sess);
     if (n->opts) ort->ReleaseSessionOptions(n->opts);
     if (n->env) ort->ReleaseEnv(n->env);
     free(n->probe_buf);
-}
-
-/* ---- the policy graph -------------------------------------------------------- */
-/* One parent board and its move list in, one logit per move out: (1, 1296) and (M, 3)
- * int32, rows (from, to, special) in the board's canonical frame. Shares the value
- * graph's environment and session options, so it runs on the same provider. */
-typedef struct {
-    OrtSession    *sess;
-    OrtMemoryInfo *meminfo;
-    OrtAllocator  *alloc;
-    const char    *in_name[2], *out_name;     /* in_name[0] is the board, [1] the moves */
-    char          *owned[3];
-    int            fp16_out;
-} Pol;
-
-/* The policy graph beside a value graph: net_fp16.onnx -> net_fp16_policy.onnx. */
-static void policy_path(const char *model, char *out, size_t n)
-{
-    size_t l = strlen(model);
-    if (l > 5 && !strcmp(model + l - 5, ".onnx"))
-        snprintf(out, n, "%.*s_policy.onnx", (int)(l - 5), model);
-    else
-        snprintf(out, n, "%s_policy.onnx", model);
-}
-
-static int pol_open(Pol *q, const Net *base, const char *path, int verbose)
-{
-    memset(q, 0, sizeof(*q));
-    if (access(path, R_OK) != 0) return -1;
-    ORT_CHECK(ort->CreateSession(base->env, path, base->opts, &q->sess));
-    ORT_CHECK(ort->CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &q->meminfo));
-    ORT_CHECK(ort->GetAllocatorWithDefaultOptions(&q->alloc));
-    size_t nin = 0, nout = 0;
-    ORT_CHECK(ort->SessionGetInputCount(q->sess, &nin));
-    ORT_CHECK(ort->SessionGetOutputCount(q->sess, &nout));
-    if (nin != 2 || nout != 1) {
-        fprintf(stderr, "%s: a policy graph has inputs (board, moves) and one output; got %zu/%zu\n",
-                path, nin, nout);
-        exit(1);
-    }
-    char *a, *b;
-    ORT_CHECK(ort->SessionGetInputName(q->sess, 0, q->alloc, &a));
-    ORT_CHECK(ort->SessionGetInputName(q->sess, 1, q->alloc, &b));
-    int swap = !strcmp(a, "moves");
-    q->owned[0] = a; q->owned[1] = b;
-    q->in_name[0] = swap ? b : a;
-    q->in_name[1] = swap ? a : b;
-    ORT_CHECK(ort->SessionGetOutputName(q->sess, 0, q->alloc, &q->owned[2]));
-    q->out_name = q->owned[2];
-    OrtTypeInfo *ti = NULL;
-    const OrtTensorTypeAndShapeInfo *tsi = NULL;
-    ONNXTensorElementDataType et;
-    ORT_CHECK(ort->SessionGetOutputTypeInfo(q->sess, 0, &ti));
-    ORT_CHECK(ort->CastTypeInfoToTensorInfo(ti, &tsi));
-    ORT_CHECK(ort->GetTensorElementType(tsi, &et));
-    q->fp16_out = (et == ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT16);
-    ort->ReleaseTypeInfo(ti);
-    if (verbose)
-        fprintf(stderr, "policy %s (hash %08x): inputs '%s','%s', logits are %s\n", path,
-                hash_file(path), q->in_name[0], q->in_name[1], q->fp16_out ? "float16" : "float32");
-    return 0;
-}
-
-static void pol_eval(Pol *q, const int32_t *board, const int32_t *mv3, int m, float *out)
-{
-    int64_t bs[2] = { 1, NSQ }, ms[2] = { m, 3 };
-    OrtValue *in[2] = { NULL, NULL }, *res = NULL;
-    ORT_CHECK(ort->CreateTensorWithDataAsOrtValue(q->meminfo, (void *)board, NSQ * sizeof(int32_t),
-                                                  bs, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &in[0]));
-    ORT_CHECK(ort->CreateTensorWithDataAsOrtValue(q->meminfo, (void *)mv3, (size_t)m * 3 * sizeof(int32_t),
-                                                  ms, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT32, &in[1]));
-    ORT_CHECK(ort->Run(q->sess, NULL, q->in_name, (const OrtValue *const *)in, 2, &q->out_name, 1, &res));
-    void *raw = NULL;
-    ORT_CHECK(ort->GetTensorMutableData(res, &raw));
-    if (q->fp16_out) { const uint16_t *h = (const uint16_t *)raw; for (int i = 0; i < m; i++) out[i] = half_to_float(h[i]); }
-    else             memcpy(out, raw, (size_t)m * sizeof(float));
-    ort->ReleaseValue(res);
-    ort->ReleaseValue(in[0]);
-    ort->ReleaseValue(in[1]);
-}
-
-static void pol_close(Pol *q)
-{
-    for (int i = 0; i < 3; i++)
-        if (q->owned[i]) { OrtStatus *st = ort->AllocatorFree(q->alloc, q->owned[i]); if (st) ort->ReleaseStatus(st); }
-    if (q->meminfo) ort->ReleaseMemoryInfo(q->meminfo);
-    if (q->sess) ort->ReleaseSession(q->sess);
 }
 
 /* ---- GPU utilisation ------------------------------------------------------- */
@@ -594,8 +526,8 @@ static void snapshot(const Pos *p, uint16_t *out)
 
 /* ---- output format --------------------------------------------------------- */
 #define TKN_MAGIC   "TKYNNSP"
-#define TKN_VERSION 6u
-#define TKN_FILE_HDR 128
+#define TKN_VERSION 7u
+#define TKN_FILE_HDR 256
 #define TKN_GAME_HDR 16
 #define TKN_BOARD   (NSQ * 2)
 #define TKN_REC     (TKN_BOARD + 16)
@@ -608,13 +540,14 @@ enum { PF_CAPTURE = 1, PF_PROMOTION = 2, PF_FORCED_KING = 4, PF_TERMINAL = 8,
 typedef struct {
     uint16_t board[NSQ];    /* absolute, after the move */
     uint32_t move;          /* special << 28 | origin << 17 | target << 6 */
-    float    value;         /* the network's value for the chosen leaf, opponent's view */
+    float    value;         /* the board's value for the side now to move: the searched
+                             * Q, or the network's value at --sims 0 */
     uint16_t n_legal;       /* legal moves in the position the move was played from */
     int16_t  material;      /* after the move, black minus white, mat_shift units */
     uint8_t  side;          /* the mover: 1 black, 0 white */
     uint8_t  flags;
-    uint16_t n_scored;      /* children actually evaluated; 0 in files written before
-                             * --subset-fraction existed, which means "all of them" */
+    uint16_t n_scored;      /* network evaluations the move cost; 0 in files written
+                             * before version 2, which means "every child" */
 } PlyRecNN;
 _Static_assert(sizeof(PlyRecNN) == TKN_REC, "PlyRecNN must match the on-disk record exactly");
 
@@ -653,17 +586,17 @@ typedef struct {
     uint64_t overridden;    /* plies where the rule changed the pick */
     uint64_t hopeless;      /* plies where every move lost the King */
     double   t_enc, t_nn, t_safe, t_pol;
-    int32_t *parent;        /* the position itself, encoded, for the policy graph */
-    int32_t *mv3;           /* its moves as policy rows (from, to, special) */
+    int32_t *parent;        /* the position itself, encoded, for its policy logits */
+    int32_t *mv4;           /* its moves as graph rows (0, from, to, special) */
     float   *logits;
     struct Ranked { float l; int i; } *rk;
 } Scratch;
 
-/* Which children the value head scores. With a policy graph: the policy's top `top` of
- * the legal moves plus `explore` more drawn at random from the rest, so the policy's
- * misses still get evaluated -- and recorded, so the next policy can learn them. With
- * pol NULL, every child, as elo --vs-full's opponent does. */
-typedef struct { Pol *pol; double top, explore; } Pick;
+/* The one-ply search scores the children of the policy's top POLICY_TOP of the legal
+ * moves plus POLICY_EXPLORE more drawn at random from the rest, so the policy's misses
+ * still get evaluated -- and recorded, so the next policy can learn them. */
+#define POLICY_TOP     0.05
+#define POLICY_EXPLORE 0.02
 
 static void gen_init(Gen *g)
 {
@@ -689,7 +622,7 @@ static void scratch_free(Scratch *s)
     free(s->g.buf); free(s->g.stamp); free(s->g.kline);
     free(s->rg.buf); free(s->rg.stamp); free(s->rg.kline);
     free(s->boards); free(s->values); free(s->weights); free(s->perm); free(s->child);
-    free(s->parent); free(s->mv3); free(s->logits); free(s->rk);
+    free(s->parent); free(s->mv4); free(s->logits); free(s->rk);
 }
 
 static void scratch_reserve(Scratch *s, int n)
@@ -700,10 +633,10 @@ static void scratch_reserve(Scratch *s, int n)
     s->values  = realloc(s->values,  (size_t)s->cap * sizeof(float));
     s->weights = realloc(s->weights, (size_t)s->cap * sizeof(double));
     s->perm    = realloc(s->perm,    (size_t)s->cap * sizeof(int));
-    s->mv3     = realloc(s->mv3,     (size_t)s->cap * 3 * sizeof(int32_t));
+    s->mv4     = realloc(s->mv4,     (size_t)s->cap * 4 * sizeof(int32_t));
     s->logits  = realloc(s->logits,  (size_t)s->cap * sizeof(float));
     s->rk      = realloc(s->rk,      (size_t)s->cap * sizeof(*s->rk));
-    if (!s->boards || !s->values || !s->weights || !s->perm || !s->mv3 || !s->logits || !s->rk) {
+    if (!s->boards || !s->values || !s->weights || !s->perm || !s->mv4 || !s->logits || !s->rk) {
         fprintf(stderr, "oom in candidate buffers\n");
         exit(1);
     }
@@ -753,15 +686,14 @@ static int rank_desc(const void *a, const void *b)
     return x < y ? 1 : x > y ? -1 : 0;
 }
 
-/* Puts the children to score first in s->perm, and returns how many. One policy pass over
- * the parent ranks every legal move; the value head then sees the top few and a few at
+/* Puts the children to score first in s->perm, and returns how many. One pass over the
+ * parent ranks every legal move; the value head then sees the top few and a few at
  * random. Everything unscored stays in s->perm after them, in policy order, for the
  * King-safety fallback. */
-static int pick_children(const Pick *pk, const Pos *p, Scratch *s, Rng *rng)
+static int pick_children(Net *net, const Pos *p, Scratch *s, Rng *rng)
 {
     int n = s->g.n;
     for (int i = 0; i < n; i++) s->perm[i] = i;
-    if (!pk || !pk->pol || pk->top >= 1.0) return n;
     double t0 = now_s();
     encode_stm(p, s->parent);
     int flip = p->turn != SIDE_BLACK;          /* encode_stm rotates white to move */
@@ -773,13 +705,14 @@ static int pick_children(const Pick *pk, const Pos *p, Scratch *s, Rng *rng)
             t = NSQ - 1 - t;
             if (sp >= 1 && sp <= 8) sp = (sp - 1 + 4) % 8 + 1;   /* DIRS[i] -> DIRS[i+4] */
         }
-        s->mv3[3 * i] = o; s->mv3[3 * i + 1] = t; s->mv3[3 * i + 2] = sp;
+        s->mv4[4 * i] = 0; s->mv4[4 * i + 1] = o; s->mv4[4 * i + 2] = t; s->mv4[4 * i + 3] = sp;
     }
-    pol_eval(pk->pol, s->parent, s->mv3, n, s->logits);
+    float pv;
+    ORT_CHECK(net_run_raw(net, s->parent, 1, s->mv4, n, &pv, s->logits));
     for (int i = 0; i < n; i++) { s->rk[i].l = s->logits[i]; s->rk[i].i = i; }
     qsort(s->rk, (size_t)n, sizeof(*s->rk), rank_desc);
     for (int i = 0; i < n; i++) s->perm[i] = s->rk[i].i;
-    int top = (int)ceil(pk->top * n), ex = (int)(pk->explore * n + 0.5);
+    int top = (int)ceil(POLICY_TOP * n), ex = (int)(POLICY_EXPLORE * n + 0.5);
     if (top < 1) top = 1;
     if (top > n) top = n;
     if (ex > n - top) ex = n - top;
@@ -797,13 +730,13 @@ static int pick_children(const Pick *pk, const Pos *p, Scratch *s, Rng *rng)
  * checked and only the safe ones are sent to the network, so pruning can never hide the
  * defence. Reports the chosen leaf's value, how many children were scored, and whether the
  * rule changed the pick. */
-static uint32_t choose(Net *net, int king_safety, const Pick *pk, const Pos *p,
+static uint32_t choose(Net *net, int king_safety, const Pos *p,
                        Scratch *s, Rng *rng, double T, float *val, int *n_scored,
                        int *overridden)
 {
     int n = s->g.n;
     scratch_reserve(s, n);
-    int scored = pick_children(pk, p, s, rng);
+    int scored = pick_children(net, p, s, rng);
     double t0 = now_s();
     for (int i = 0; i < scored; i++) {
         uint32_t v = s->g.buf[s->perm[i]];
@@ -886,8 +819,8 @@ static uint32_t choose_random(int king_safety, const Pos *p, Scratch *s, Rng *rn
     return s->g.buf[s->perm[0]];
 }
 
-/* ---- Elo against a random baseline ----------------------------------------- */
-/* The random mover is anchored at Elo 0 and the bot's rating is the posterior over the
+/* ---- Elo ------------------------------------------------------------------- */
+/* The baseline is anchored at Elo 0 and the bot's rating is the posterior over the
  * difference, in BayesElo's model: Rao-Kupper with an explicit draw rating, plus a
  * first-move advantage, since black moves first here.
  *
@@ -1053,11 +986,11 @@ static int sprt_decide(const Sprt *s, double llr)
 }
 /* ---- end SPRT -------------------------------------------------------------- */
 
-/* ---- self-play ------------------------------------------------------------- */
+/* ---- settings ------------------------------------------------------------- */
 typedef struct {
     int      max_plies, rep_limit, no_progress_limit, stalemate_loses, mat_shift, regicide;
-    int      progress;      /* print a line every this many plies; 0 is off */
-    int      stats;         /* per-ply wall-clock breakdown and GPU utilisation */
+    int      progress;      /* seconds between status lines; 0 is off */
+    int      stats;         /* GPU utilisation in the status lines */
     double   temperature;
     uint64_t seed_base;
     const char *out_path;
@@ -1069,8 +1002,20 @@ typedef struct {
     int      resign_pawns;         /* adjudicate a lead this large ... (0 disables) */
     int      resign_plies;         /* ... held this many plies in a row */
     int      cap_by_material;      /* score the ply cap for the side ahead, not as a draw */
-    double   policy_top;           /* the value head scores the policy's top this much... */
-    double   policy_explore;       /* ...plus this much more of the legal moves at random */
+    int      drop_capped;          /* play: write no game that reached the ply cap */
+    int      endgames;             /* play: random sparse starts, only royal captures kept */
+    int      eg_max_pieces;        /* fewer pieces than this on the board, Kings included */
+    int      eg_imbalance;         /* the side ahead leads by at least this many pawns */
+    int      sims;                 /* simulations per move; 0 is the one-ply search */
+    int      opp_sims;             /* elo: the opponent's */
+    int      leaves;               /* leaves a tree gathers per network call */
+    int      games_par;            /* games in lockstep */
+    double   cpuct;
+    double   noise_frac;           /* root Dirichlet noise mixed into the priors; 0 is none */
+    double   noise_alpha;          /* alpha = noise_alpha / legal moves */
+    double   contempt;             /* a draw costs the searching side up to this much */
+    int      contempt_flat;        /* play: ... always that much, whatever the root's value */
+    double   soft_scale;           /* play: a capped or repeated game's label, on material */
 } Cfg;
 
 /* A step schedule, as AlphaZero uses: a hot opening so games diverge, then the playing
@@ -1116,11 +1061,121 @@ static int cap_result(const Cfg *c, const Pos *p)
     return p->material > 0 ? RES_BLACK : RES_WHITE;
 }
 
+/* ---- --endgames: random sparse starting positions --------------------------------- */
+/* Self-play from the opening almost never reaches a bare King, so the network never sees
+ * a mate delivered. These starts do: one King each, fewer than eg_max_pieces pieces in
+ * all, the side ahead by at least eg_imbalance pawns holding a ranging piece.
+ *
+ * A piece is drawn uniformly over the 300 non-King ids. One that only arises by promotion
+ * is placed promoted; one from the starting setup is placed as itself or, if it has a
+ * promotion, as that promotion, 50/50. An unpromoted piece that could promote is kept out
+ * of its own promotion zone, where play could never leave it standing.
+ *
+ * Splitting pieces evenly between the sides meets a 50-pawn lead in ~9% of draws (the
+ * mean piece is worth ~8 pawns), so the side meant to be ahead gets the ranging piece and
+ * at least half the rest: ~35% of draws pass at the defaults. */
+#define EG_MAX_FAILS 100
+static uint8_t EG_RANGING[NPIECE];     /* an unlimited slide in some direction */
+static uint8_t EG_IN_SETUP[NPIECE];
+
+typedef struct { uint64_t made, short_lead, king_hangs; } EgStats;
+
+static void eg_tables(void)
+{
+    for (int i = 0; i < NSQ; i++) EG_IN_SETUP[C_IDX(INIT_BOARD[i])] = 1;
+    for (int i = 1; i < NPIECE; i++) {
+        const PieceDef *d = &DEFS[i * 2 + SIDE_BLACK];
+        for (int k = 0; k < 8; k++) if (d->dydx[k] == 99) EG_RANGING[i] = 1;
+        for (int t = 0; t < d->tp_n; t++)
+            for (int k = 0; k < 8; k++) if (TP_POOL[d->tp_off + t].slide[k] == 99) EG_RANGING[i] = 1;
+    }
+}
+
+static void eg_draw(Rng *rng, int *idx, int *prom)
+{
+    int i = 1 + (int)rng_below(rng, KING_IDX - 1);
+    if (!EG_IN_SETUP[i])                                       { *idx = i; *prom = 1; }
+    else if (PROMOTE_IDX[i] >= 0 && rng_below(rng, 2))         { *idx = PROMOTE_IDX[i]; *prom = 1; }
+    else                                                       { *idx = i; *prom = 0; }
+}
+
+static void eg_place(Pos *p, Rng *rng, int idx, int prom, int color)
+{
+    for (;;) {
+        int s = (int)rng_below(rng, NSQ), q = SQ2P[s], x = s / 36;
+        if (p->side[q] != SIDE_EMPTY) continue;
+        if (!prom && PROMOTE_IDX[idx] >= 0 && (color == SIDE_BLACK ? x >= 25 : x <= 10)) continue;
+        sq_set(p, q, (uint16_t)CODE(idx, color, prom));
+        return;
+    }
+}
+
+/* 0, or -1 once EG_MAX_FAILS draws in a row have been rejected */
+static int eg_generate(Pos *p, const Cfg *c, Rng *rng, Gen *g, EgStats *st)
+{
+    for (int fails = 0; fails <= EG_MAX_FAILS; fails++) {
+        memset(p, 0, sizeof(*p));
+        p->royal_sq[0] = p->royal_sq[1] = -1;
+        memset(p->side, SIDE_OFF, sizeof(p->side));
+        for (int i = 0; i < NPAD; i++) p->pat[i] = -1;
+        for (int i = 0; i < NSQ; i++) {
+            int q = SQ2P[i];
+            p->side[q] = SIDE_EMPTY;
+            p->code[q] = EMPTY_CODE;
+            p->hash ^= zkey(q, EMPTY_CODE);
+        }
+        int n = 3 + (int)rng_below(rng, (uint32_t)(c->eg_max_pieces - 3));
+        int att = (int)rng_below(rng, 2), idx, prom;
+        eg_place(p, rng, KING_IDX, 0, SIDE_BLACK);
+        eg_place(p, rng, KING_IDX, 0, SIDE_WHITE);
+        do eg_draw(rng, &idx, &prom); while (!EG_RANGING[idx]);
+        eg_place(p, rng, idx, prom, att);
+        int extra = n - 3, nd = (int)rng_below(rng, (uint32_t)(extra / 2 + 1));
+        for (int j = 0; j < extra; j++) {
+            eg_draw(rng, &idx, &prom);
+            eg_place(p, rng, idx, prom, j < nd ? 1 - att : att);
+        }
+        p->turn = (int)rng_below(rng, 2);
+        if (p->turn) p->hash ^= TURN_KEY;
+
+        int64_t lead = (int64_t)c->eg_imbalance * VALUE_FP;
+        int ahead = p->material >= lead ? SIDE_BLACK : p->material <= -lead ? SIDE_WHITE : -1;
+        int armed = 0;
+        for (int k = 0; ahead >= 0 && k < p->pn[ahead]; k++)
+            armed |= EG_RANGING[C_IDX(p->code[p->plist[ahead][k]])];
+        if (!armed) { st->short_lead++; continue; }
+        /* Either King capturable: the side to move takes it at once, or its own is lost
+         * before it can escape. Since only royal captures are kept, those 1-2 ply games
+         * would crowd out the mates. */
+        int hangs = 0;
+        for (int k = 0; k < 2 && !hangs; k++, p->turn ^= 1) {
+            gen_all(p, g);
+            king_ctx_set(g, p);
+            hangs = find_king_capture(g) != 0;
+        }
+        if (hangs) { st->king_hangs++; continue; }
+        st->made++;
+        return 0;
+    }
+    return -1;
+}
+
+/* Play's training label, black's view: the result, except that a game cut off by the ply
+ * cap or by repetition is scored on material, soft_scale * tanh(pawns / SOFT_PAWNS). */
+#define SOFT_PAWNS 300.0
+static double soft_label(const Cfg *c, const Pos *p, int result, int term)
+{
+    if (c->soft_scale > 0.0 && (term == TERM_PLYCAP || term == TERM_REPETITION))
+        return c->soft_scale * tanh((double)p->material / VALUE_FP / SOFT_PAWNS);
+    return result == RES_BLACK ? 1.0 : result == RES_WHITE ? -1.0 : 0.0;
+}
+
 static void put_file_header(Sink *s, const Cfg *c, const Net *net, const char *model,
                             uint32_t model_hash)
 {
     unsigned char hdr[TKN_FILE_HDR];
     uint32_t v;
+    float f;
     memset(hdr, 0, sizeof(hdr));
     memcpy(hdr, TKN_MAGIC, 8);
     v = TKN_VERSION;                  memcpy(hdr + 8,  &v, 4);
@@ -1153,11 +1208,14 @@ static void put_file_header(Sink *s, const Cfg *c, const Net *net, const char *m
     o16 = (uint16_t)(c->opening_temperature * 1000.0 + 0.5);
     memcpy(hdr + 94, &o16, 2);
     v = (uint32_t)net->sub_batch;     memcpy(hdr + 96, &v, 4);
-    /* 100: bit 0 fp16; version 6 on, bits 8..15 policy_explore and bits 16..31
-     * policy_top, both in thousandths of the legal moves */
-    v = (uint32_t)(net->fp16_out ? 1 : 0)
-      | ((uint32_t)(c->policy_explore * 1000.0 + 0.5) & 0xFFu) << 8
-      | ((uint32_t)(c->policy_top * 1000.0 + 0.5) & 0xFFFFu) << 16;
+    /* 100: bit 0 fp16; bit 1 games that reached the ply cap were dropped; bit 2 games
+     * started from random --endgames positions, only royal captures kept; version 6 on,
+     * bits 8..15 policy_explore and bits 16..31 policy_top of the one-ply search, both in
+     * thousandths of the legal moves, and 0 under search */
+    int oneply = c->sims == 0;
+    v = (uint32_t)(net->fp16[0] ? 1 : 0) | (c->drop_capped ? 2u : 0u) | (c->endgames ? 4u : 0u)
+      | (oneply ? ((uint32_t)(POLICY_EXPLORE * 1000.0 + 0.5) & 0xFFu) << 8
+                | ((uint32_t)(POLICY_TOP * 1000.0 + 0.5) & 0xFFFFu) << 16 : 0u);
     memcpy(hdr + 100, &v, 4);
     /* 104..127: "<basename>@<8 hex of the graph's hash>", NUL padded. The hash is what
      * makes a shard attributable to a specific set of weights: in a self-play loop the
@@ -1168,6 +1226,25 @@ static void put_file_header(Sink *s, const Cfg *c, const Net *net, const char *m
     char tag[32];
     snprintf(tag, sizeof(tag), "%.14s@%08x", base, model_hash);
     memcpy(hdr + 104, tag, strlen(tag) < 24 ? strlen(tag) : 24);
+    /* 128..255, version 7 on: the search. 128 simulations per move (0: the one-ply
+     * search), 132 leaves a tree gathers per network call, 136 f32 c_puct, 140 f32 the
+     * root noise's share, 144 f32 its alpha numerator (alpha = it / legal moves), 148
+     * games in lockstep, 152 the opponent's simulations (elo), 156 bits: 0 tree reuse,
+     * 1 min-max normalised Q, 2 unvisited children at the parent's value, 3 flat contempt
+     * (self-play; else scaled by the root's value as in tree_contempt), 160 f32 the
+     * contempt (0 in files written before it existed), 164 f32 the soft label's scale and
+     * 168 f32 its pawns (0: none; then each game header's bytes 6..7 hold the label) */
+    v = (uint32_t)c->sims;            memcpy(hdr + 128, &v, 4);
+    v = (uint32_t)c->leaves;          memcpy(hdr + 132, &v, 4);
+    f = (float)c->cpuct;              memcpy(hdr + 136, &f, 4);
+    f = (float)c->noise_frac;         memcpy(hdr + 140, &f, 4);
+    f = (float)c->noise_alpha;        memcpy(hdr + 144, &f, 4);
+    v = (uint32_t)c->games_par;       memcpy(hdr + 148, &v, 4);
+    v = (uint32_t)c->opp_sims;        memcpy(hdr + 152, &v, 4);
+    v = c->sims ? 7u | (c->contempt_flat ? 8u : 0u) : 0u; memcpy(hdr + 156, &v, 4);
+    f = (float)c->contempt;           memcpy(hdr + 160, &f, 4);
+    f = (float)c->soft_scale;         memcpy(hdr + 164, &f, 4);
+    f = c->soft_scale > 0.0 ? (float)SOFT_PAWNS : 0.0f; memcpy(hdr + 168, &f, 4);
     sink_put(s, hdr, TKN_FILE_HDR);
 }
 
@@ -1205,7 +1282,7 @@ static void tkn_fill(PlyRecNN *r, const Pos *p, uint32_t pick, float value, int 
 }
 
 static void tkn_put_game(Sink *s, PlyRecNN *plies, int nply, int result, int term,
-                         uint64_t seed)
+                         double label, uint64_t seed)
 {
     if (nply) plies[nply - 1].flags |= PF_TERMINAL;
     unsigned char gh[TKN_GAME_HDR];
@@ -1214,7 +1291,8 @@ static void tkn_put_game(Sink *s, PlyRecNN *plies, int nply, int result, int ter
     /* the user-facing score: 1 black, -1 white, 0 a draw */
     gh[4] = (unsigned char)(int8_t)(result == RES_BLACK ? 1 : result == RES_WHITE ? -1 : 0);
     gh[5] = (unsigned char)term;
-    gh[6] = 0; gh[7] = 0;
+    int16_t l16 = (int16_t)lrint(label * 10000.0);  /* the training label, in 1/10000 */
+    memcpy(gh + 6, &l16, 2);
     memcpy(gh + 8, &seed, 8);
     sink_put(s, gh, TKN_GAME_HDR);
     sink_put(s, plies, (size_t)nply * TKN_REC);
@@ -1232,37 +1310,48 @@ static void tkn_close(Sink *s, uint64_t games, uint64_t plies)
     s->fd = -1;
 }
 
-/* ---- .kids: the children the search scored -------------------------------------- */
-/* Policy training wants, for each position, the moves the search looked at and what the
- * value head said about each. The .tkn keeps only the move played; this side file keeps
- * the rest, at no extra network cost since the values were computed anyway.
+/* ---- .kids: what the search saw at each ply -------------------------------------- */
+/* The .tkn keeps only the move played; this side file keeps what policy training learns
+ * from, at no extra network cost.
  *
- *   file header, 32 bytes: "TKYKIDS\0", u32 version 1, u32 header size 32, u32 child size
- *       6, u32 game header size 24, u64 games (patched at close)
+ *   file header, 32 bytes: "TKYKIDS\0", u32 version, u32 header size 32, u32 child size,
+ *       u32 game header size 24, u64 games (patched at close)
  *   per game, 24 bytes: u32 n_plies, u32 reserved, u64 seed, u64 FNV-1a 64 of the game's
  *       ply-record move words, in order -- (seed, n_plies, hash) finds the matching .tkn
  *       game even after files are merged or reordered
- *   per ply: u16 n, then n children of { u32 move, u16 value as IEEE half }
+ *   per ply: u16 n, then n children
+ *     version 1 (--sims 0), 6 bytes each: { u32 move, u16 value as IEEE half } -- every
+ *       child the value head scored
+ *     version 2 (search), 8 bytes each: { u32 move, u16 visits, u16 value as half } --
+ *       every root child the search visited, with its mean value
  *
  * Ply k's children belong to the position *before* move k: the .tkn record k-1's board,
  * or the start position for k = 0. A move uses the ply record's packing, special << 28 |
- * origin << 17 | target << 6, absolute frame. A value is the network's, for the side to
- * move after that child, exactly as the search saw it: the mover prefers low values. A
- * forced King capture is stored as its single child. */
+ * origin << 17 | target << 6, absolute frame. A value is for the side to move after that
+ * child: the mover prefers low values. A forced King capture is stored as its single
+ * child. Games in lockstep fill their own buffers, so a file's games never interleave. */
 #define KIDS_MAGIC "TKYKIDS"
 #define KIDS_FILE_HDR 32
 #define KIDS_GAME_HDR 24
 
-typedef struct {
-    Sink     sink;
-    unsigned char *buf;            /* the current game, until its header is known */
-    size_t   len, cap;
-    uint64_t games;
-} Kids;
+typedef struct { unsigned char *b; size_t len, cap; } Bytes;
+typedef struct { Sink sink; uint64_t games; int version; } Kids;
 
-static int kids_open(Kids *k, const char *path)
+static void bytes_put(Bytes *x, const void *d, size_t n)
+{
+    if (x->len + n > x->cap) {
+        x->cap = (x->len + n) * 2;
+        x->b = realloc(x->b, x->cap);
+        if (!x->b) { fprintf(stderr, "oom in --children buffer\n"); exit(1); }
+    }
+    memcpy(x->b + x->len, d, n);
+    x->len += n;
+}
+
+static int kids_open(Kids *k, const char *path, int version)
 {
     memset(k, 0, sizeof(*k));
+    k->version = version;
     k->sink.cap = 1u << 22;
     k->sink.fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
     if (k->sink.fd < 0) { perror(path); return -1; }
@@ -1270,41 +1359,32 @@ static int kids_open(Kids *k, const char *path)
     unsigned char h[KIDS_FILE_HDR];
     memset(h, 0, sizeof(h));
     memcpy(h, KIDS_MAGIC, 8);
-    uint32_t v = 1;              memcpy(h + 8, &v, 4);
-    v = KIDS_FILE_HDR;           memcpy(h + 12, &v, 4);
-    v = 6;                       memcpy(h + 16, &v, 4);
-    v = KIDS_GAME_HDR;           memcpy(h + 20, &v, 4);
+    uint32_t v = (uint32_t)version; memcpy(h + 8, &v, 4);
+    v = KIDS_FILE_HDR;              memcpy(h + 12, &v, 4);
+    v = version == 2 ? 8 : 6;       memcpy(h + 16, &v, 4);
+    v = KIDS_GAME_HDR;              memcpy(h + 20, &v, 4);
     sink_put(&k->sink, h, sizeof(h));
     return 0;
 }
 
-static void kids_need(Kids *k, size_t more)
-{
-    if (k->len + more <= k->cap) return;
-    k->cap = (k->len + more) * 2;
-    k->buf = realloc(k->buf, k->cap);
-    if (!k->buf) { fprintf(stderr, "oom in --children buffer\n"); exit(1); }
-}
-
-/* n children: moves[i] in nnplay's internal packing, indexed through perm (NULL for the
- * identity), with their values. */
-static void kids_ply(Kids *k, const uint32_t *moves, const int *perm, const float *values, int n)
+/* One ply: n children, moves[i] in nnplay's internal packing, indexed through perm (NULL
+ * for the identity), with their values, and with their visits for version 2. */
+static void kids_ply(Bytes *x, const uint32_t *moves, const int *perm, const float *values,
+                     const int *visits, int n)
 {
     if (n > 65535) n = 65535;
-    kids_need(k, 2 + (size_t)n * 6);
     uint16_t c = (uint16_t)n;
-    memcpy(k->buf + k->len, &c, 2);
-    k->len += 2;
+    bytes_put(x, &c, 2);
     for (int i = 0; i < n; i++) {
         uint32_t m = file_move(moves[perm ? perm[i] : i]);
         uint16_t h = float_to_half(values[i]);
-        memcpy(k->buf + k->len, &m, 4);
-        memcpy(k->buf + k->len + 4, &h, 2);
-        k->len += 6;
+        bytes_put(x, &m, 4);
+        if (visits) { uint16_t vv = (uint16_t)(visits[i] > 65535 ? 65535 : visits[i]); bytes_put(x, &vv, 2); }
+        bytes_put(x, &h, 2);
     }
 }
 
-static void kids_game(Kids *k, const PlyRecNN *plies, int nply, uint64_t seed)
+static void kids_game(Kids *k, Bytes *x, const PlyRecNN *plies, int nply, uint64_t seed)
 {
     uint64_t hash = 0xcbf29ce484222325ull;
     for (int i = 0; i < nply; i++) {
@@ -1318,9 +1398,9 @@ static void kids_game(Kids *k, const PlyRecNN *plies, int nply, uint64_t seed)
     memcpy(gh + 8, &seed, 8);
     memcpy(gh + 16, &hash, 8);
     sink_put(&k->sink, gh, sizeof(gh));
-    sink_put(&k->sink, k->buf, k->len);
+    sink_put(&k->sink, x->b, x->len);
     sink_flush(&k->sink);
-    k->len = 0;
+    x->len = 0;
     k->games++;
 }
 
@@ -1330,7 +1410,6 @@ static void kids_close(Kids *k)
     if (pwrite(k->sink.fd, &k->games, 8, 24) != 8) perror("pwrite");
     close(k->sink.fd);
     free(k->sink.buf);
-    free(k->buf);
 }
 
 /* Seconds as a short human string: 45s, 3m41s, 2h14m. */
@@ -1385,7 +1464,7 @@ static int manifest_ref(const char *path, double *val, double *tol)
 }
 
 /* Pure C, so proving a setup needs no Python, numpy or unpack.py on the far end. */
-static int mode_selfcheck(Net *net, Pol *pol, const char *manifest)
+static int mode_selfcheck(Net *net, const char *manifest)
 {
     double want, tol;
     if (!manifest_ref(manifest, &want, &tol)) {
@@ -1396,8 +1475,22 @@ static int mode_selfcheck(Net *net, Pol *pol, const char *manifest)
     pos_init(p);                               /* black to move: already the canonical frame */
     int32_t *b = malloc(NSQ * sizeof(int32_t));
     encode_stm(p, b);
-    float v = 0.0f;
-    net_eval(net, b, 1, &v);
+
+    /* The value and the policy in one call, as the search makes it: every legal move of
+     * the start position through the C move generator and the rows nnplay builds, against
+     * what export_onnx.py computed in torch for the same moves. */
+    Gen g;
+    memset(&g, 0, sizeof(g));
+    g.cap = 8192; g.buf = malloc(8192 * 4); g.stamp = calloc(MAXMOVE, 2); g.kline = calloc(NSQ, 2);
+    gen_all(p, &g);
+    int32_t *rows = malloc((size_t)g.n * 4 * sizeof(int32_t));
+    float *got = malloc((size_t)g.n * sizeof(float)), v = 0.0f;
+    for (int i = 0; i < g.n; i++) {
+        int mvv = UNPACK_M(g.buf[i]);
+        rows[4 * i] = 0; rows[4 * i + 1] = UNPACK_O(g.buf[i]);
+        rows[4 * i + 2] = mvv % 1296; rows[4 * i + 3] = mvv / 1296;
+    }
+    ORT_CHECK(net_run_raw(net, b, 1, rows, g.n, &v, got));
     double d = fabs((double)v - want);
     int ok = d < tol;
     printf("\nselfcheck\n"
@@ -1411,68 +1504,626 @@ static int mode_selfcheck(Net *net, Pol *pol, const char *manifest)
         printf("  This runtime does not reproduce the exported graph. Re-fuse it here with:\n"
                "    pip install onnx && python3 fuse.py net_fp16_raw.onnx net_fp16.onnx\n");
 
-    /* The policy, move for move: every legal move of the start position through the C
-     * move generator, the rows nnplay builds and the policy graph, against the logits
-     * export_onnx.py computed in torch for the same moves. */
     static double mv[3 * 8192], lg[8192];
     int nm = manifest_array("start_position_policy_moves", mv, 3 * 8192);
     int nl = manifest_array("start_position_policy_logits", lg, 8192);
-    if (pol && nm > 0 && nl * 3 == nm) {
+    if (nm > 0 && nl * 3 == nm) {
         double ptol = 0.05;
         char *q = strstr(manifest_buf, "\"policy_tolerance\"");
         if (q && (q = strchr(q, ':'))) ptol = strtod(q + 1, NULL);
-        Gen g;
-        memset(&g, 0, sizeof(g));
-        g.cap = 8192; g.buf = malloc(8192 * 4); g.stamp = calloc(MAXMOVE, 2); g.kline = calloc(NSQ, 2);
-        gen_all(p, &g);
-        int32_t *rows = malloc((size_t)g.n * 3 * sizeof(int32_t));
-        float *got = malloc((size_t)g.n * sizeof(float));
-        for (int i = 0; i < g.n; i++) {
-            int mvv = UNPACK_M(g.buf[i]);
-            rows[3 * i] = UNPACK_O(g.buf[i]); rows[3 * i + 1] = mvv % 1296; rows[3 * i + 2] = mvv / 1296;
-        }
-        pol_eval(pol, b, rows, g.n, got);
         int matched = 0;
         double worst = 0.0;
         for (int i = 0; i < g.n; i++)
             for (int j = 0; j < nl; j++)
-                if (mv[3 * j] == rows[3 * i] && mv[3 * j + 1] == rows[3 * i + 1] && mv[3 * j + 2] == rows[3 * i + 2]) {
+                if (mv[3 * j] == rows[4 * i + 1] && mv[3 * j + 1] == rows[4 * i + 2]
+                    && mv[3 * j + 2] == rows[4 * i + 3]) {
                     matched++;
-                    double d = fabs((double)got[i] - lg[j]);
-                    if (d > worst) worst = d;
+                    double dd = fabs((double)got[i] - lg[j]);
+                    if (dd > worst) worst = dd;
                     break;
                 }
         int pok = matched == g.n && g.n == nl && worst < ptol;
         printf("  policy          %d moves, %d matched the export's, largest logit deviation %.2e "
                "(tolerance %.0e)   %s\n", g.n, matched, worst, ptol, pok ? "PASS" : "FAIL");
         ok = ok && pok;
-        free(rows); free(got); free(g.buf); free(g.stamp); free(g.kline);
-    } else if (pol) {
+    } else {
         printf("  policy          the manifest has no start-position policy -- re-run export_onnx.py\n");
         ok = 0;
-    } else {
-        printf("  policy          no policy graph: play, elo and variance will refuse this model\n");
     }
     fflush(stdout);
+    free(rows); free(got); free(g.buf); free(g.stamp); free(g.kline);
     free(b);
     free(p);
     return ok ? 0 : 1;
 }
 
+/* ---- search ---------------------------------------------------------------------- */
+/* PUCT over the policy's priors and the value head, as AlphaZero, with these choices:
+ *
+ *   - Q is min-max normalised over the tree before it meets c * P * sqrt(N) / (1 + n)
+ *     (MuZero). Children's values differ by ~0.01, so raw Q would barely steer the visits.
+ *   - An unvisited child is scored at its parent's network value.
+ *   - Priors are softmax(logits) over every legal move.
+ *   - A tree walks `leaves` times before the network sees the leaves, each pending visit
+ *     counting as a loss on its path (virtual loss) so the next walk goes elsewhere. The
+ *     games in lockstep pool their leaves into one call.
+ *   - The searched subtree under the move played is kept for the next move.
+ *
+ * The tree models three rules itself: a position where the side to move can take the King
+ * is a win for it (forced regicide), one seen rep_limit times is a draw, and with King
+ * safety a move that leaves the mover's own King capturable is never played while another
+ * is not -- such an edge is pruned when first reached, and a node whose every edge is
+ * pruned is lost. Without the last, a King threat with a handful of escapes among hundreds
+ * of replies averaged out near a forced win. The ply cap and resignation are left to the
+ * value head, whose training labels already carry them.
+ *
+ * A node's w sums the values backed up through it from the view of the side that moved
+ * into it, so a parent prefers the child with the highest w / n. */
+typedef struct { uint32_t mv; float p; int32_t c; } Edge;     /* c: child, -1 none yet */
+#define PRUNED (-2)                                               /* c: hangs the King */
+typedef struct {
+    uint64_t h;
+    int32_t  e0, ne;        /* its edges, once expanded */
+    int32_t  n, vl;         /* visits, and how many of them are still pending */
+    float    w, v;          /* value sum, the mover's view; network value, the side to move's */
+    float    tv;            /* terminal value, the side to move's view */
+    int8_t   term, pend;    /* term: 1 decided, tv; 2 a draw, valued by the contempt */
+    int16_t  npr;           /* edges pruned */
+} Node;
+
+typedef struct Tree Tree;
+
+/* Leaves from every tree, for one network call. */
+typedef struct {
+    int32_t *boards, *rows;
+    float   *val, *lgt;
+    Tree   **tr;
+    int     *leaf, *roff;
+    int      nb, cb, nr, cr;
+} Batch;
+
+struct Tree {
+    Node    *nd;  int nn, cn;
+    Edge    *ed;  int ne, cne;
+    int      root;
+    Pos      pos, walk;       /* the root position; a scratch copy for each walk */
+    double   qmin, qmax;
+    double   noise_frac, noise_alpha;
+    double   contempt_c, contempt;  /* --contempt, and what a draw costs this move */
+    int      contempt_flat;
+    Rng     *rng;
+    int      todo;            /* simulations still to run for this move */
+    int      evals;           /* leaves sent to the network for this move */
+    int      noise;           /* root noise still to apply */
+    int      np;              /* leaves waiting for the network */
+    int     *pnode, *poff, *plen, *pmoff, *pmcnt;
+    int     *path; int npath, cpath;
+    uint32_t *pmv; int npmv, cpmv;
+};
+
+static void *grow(void *p, int *cap, int need, size_t elt)
+{
+    if (need <= *cap) return p;
+    *cap = need * 2 > 1024 ? need * 2 : 1024;
+    p = realloc(p, (size_t)*cap * elt);
+    if (!p) { fprintf(stderr, "oom in the search\n"); exit(1); }
+    return p;
+}
+
+static int tree_node(Tree *t, uint64_t h)
+{
+    t->nd = grow(t->nd, &t->cn, t->nn + 1, sizeof(Node));
+    Node *x = &t->nd[t->nn];
+    memset(x, 0, sizeof(*x));
+    x->h = h;
+    return t->nn++;
+}
+
+static void tree_reset(Tree *t, const Pos *p)
+{
+    t->nn = t->ne = 0;
+    memcpy(&t->pos, p, sizeof(Pos));
+    t->root = tree_node(t, p->hash);
+}
+
+static void tree_init(Tree *t, int leaves, Rng *rng)
+{
+    memset(t, 0, sizeof(*t));
+    t->rng = rng;
+    t->pnode = malloc(sizeof(int) * (size_t)leaves);
+    t->poff  = malloc(sizeof(int) * (size_t)leaves);
+    t->plen  = malloc(sizeof(int) * (size_t)leaves);
+    t->pmoff = malloc(sizeof(int) * (size_t)leaves);
+    t->pmcnt = malloc(sizeof(int) * (size_t)leaves);
+}
+
+static void tree_free(Tree *t)
+{
+    free(t->nd); free(t->ed); free(t->path); free(t->pmv);
+    free(t->pnode); free(t->poff); free(t->plen); free(t->pmoff); free(t->pmcnt);
+}
+
+static inline void path_push(Tree *t, int s)
+{
+    t->path = grow(t->path, &t->cpath, t->npath + 1, sizeof(int));
+    t->path[t->npath++] = s;
+}
+
+/* How often h has occurred in the game so far, without counting this look. */
+static int rep_peek(const RepTab *r, uint64_t h)
+{
+    size_t i = (size_t)(h >> (64 - REP_BITS));
+    for (;;) {
+        if (r->ep[i] != r->epoch) return 0;
+        if (r->key[i] == h) return r->cnt[i];
+        i = (i + 1) & REP_MASK;
+    }
+}
+
+static double unif(Rng *r) { return ((rng_next(r) >> 11) + 0.5) * (1.0 / 9007199254740992.0); }
+
+/* Marsaglia-Tsang, with the a < 1 boost. */
+static double gamma_draw(Rng *r, double a)
+{
+    if (a < 1.0) return gamma_draw(r, a + 1.0) * pow(unif(r), 1.0 / a);
+    double d = a - 1.0 / 3.0, c = 1.0 / sqrt(9.0 * d);
+    for (;;) {
+        double x, v;
+        do {
+            x = sqrt(-2.0 * log(unif(r))) * cos(2.0 * M_PI * unif(r));
+            v = 1.0 + c * x;
+        } while (v <= 0.0);
+        v = v * v * v;
+        double u = unif(r);
+        if (u < 1.0 - 0.0331 * x * x * x * x || log(u) < 0.5 * x * x + d * (1.0 - v + log(v)))
+            return d * v;
+    }
+}
+
+/* Dirichlet noise on the root's priors, alpha = noise_alpha / legal moves (AlphaZero's
+ * scaling: 0.3 at chess's ~35 moves, 0.03 at Go's ~250, ~0.01 here). */
+static void tree_noise(Tree *t)
+{
+    Node *r = &t->nd[t->root];
+    t->noise = 0;
+    if (r->ne < 2 || t->noise_frac <= 0.0) return;
+    double alpha = t->noise_alpha / r->ne, sum = 0.0;
+    double *eta = malloc(sizeof(double) * (size_t)r->ne);
+    for (int i = 0; i < r->ne; i++) sum += eta[i] = gamma_draw(t->rng, alpha);
+    if (sum > 0.0)
+        for (int i = 0; i < r->ne; i++) {
+            Edge *e = &t->ed[r->e0 + i];
+            e->p = (float)((1.0 - t->noise_frac) * e->p + t->noise_frac * eta[i] / sum);
+        }
+    free(eta);
+}
+
+/* Contempt: a draw is worth -c * sigmoid(20 * (v_root - 0.1)) to the side searching, v_root
+ * the network's value of the root. A side that thinks it is ahead is pushed off draws; the
+ * offset keeps near-level positions from flipping between the two attitudes. Self-play
+ * uses a flat -c instead: level positions shuffled into repetition at ~0.012. */
+#define CONTEMPT_MID   0.1
+#define CONTEMPT_SLOPE 20.0
+static void tree_contempt(Tree *t)
+{
+    t->contempt = t->contempt_flat ? t->contempt_c
+                : t->contempt_c / (1.0 + exp(-CONTEMPT_SLOPE * (t->nd[t->root].v - CONTEMPT_MID)));
+}
+
+static void tree_begin(Tree *t, int sims, double noise_frac, double noise_alpha, double contempt,
+                       int flat)
+{
+    t->todo = sims;
+    t->evals = 0;
+    t->qmin = 1e30; t->qmax = -1e30;
+    t->noise_frac = noise_frac;
+    t->noise_alpha = noise_alpha;
+    t->noise = noise_frac > 0.0;
+    t->contempt_c = contempt;
+    t->contempt_flat = flat;
+    t->contempt = 0.0;
+    if (t->nd[t->root].ne) tree_contempt(t);
+    if (t->noise && t->nd[t->root].ne) tree_noise(t);
+}
+
+/* A terminal's value for its side to move. A draw is -contempt where the searching side is
+ * to move -- an even number of plies below the root -- and +contempt where its opponent is. */
+static inline double terminal_value(const Tree *t, const Node *nd, int depth)
+{
+    if (nd->term != 2) return nd->tv;
+    return depth & 1 ? t->contempt : -t->contempt;
+}
+
+static inline double tree_norm(const Tree *t, double q)
+{
+    if (t->qmax <= t->qmin) return q;
+    double x = (q - t->qmin) / (t->qmax - t->qmin);
+    return x < 0.0 ? 0.0 : x > 1.0 ? 1.0 : x;
+}
+
+/* The value v (for the leaf's side to move) up the path from `start`, undoing the
+ * virtual loss each walk put there; the root's w is never read. */
+static void tree_backup(Tree *t, int start, int len, double v)
+{
+    double x = -v;
+    for (int i = start + len - 1; i >= start; i--) {
+        Node *nd = &t->nd[t->path[i]];
+        nd->vl--;
+        if (i > start) {
+            nd->w += (float)(x + 1.0);
+            int real = nd->n - nd->vl;
+            if (real > 0) {
+                double q = (nd->w + nd->vl) / real;
+                if (q < t->qmin) t->qmin = q;
+                if (q > t->qmax) t->qmax = q;
+            }
+        } else {
+            nd->w += (float)x;
+        }
+        x = -x;
+    }
+}
+
+static void tree_undo(Tree *t, int start, int len)
+{
+    for (int i = start; i < start + len; i++) {
+        Node *nd = &t->nd[t->path[i]];
+        nd->n--; nd->vl--;
+        if (i > start) nd->w += 1.0f;
+    }
+}
+
+static int tree_select(const Tree *t, int s, double cpuct)
+{
+    const Node *nd = &t->nd[s];
+    double sq = sqrt((double)nd->n), fpu = tree_norm(t, nd->v), best = -1e300;
+    int arg = 0;
+    for (int i = 0; i < nd->ne; i++) {
+        const Edge *e = &t->ed[nd->e0 + i];
+        double q = fpu, n = 0.0;
+        if (e->c == PRUNED) continue;
+        if (e->c >= 0) { const Node *c = &t->nd[e->c]; n = c->n; q = tree_norm(t, c->w / c->n); }
+        double u = q + cpuct * e->p * sq / (1.0 + n);
+        if (u > best) { best = u; arg = i; }
+    }
+    return arg;
+}
+
+/* Whether a position just reached is decided without the network: 1 won or lost, with its
+ * value for the side to move in tv, 2 drawn, 0 not. Leaves the legal moves in g if 0. */
+static int leaf_terminal(const Pos *p, const Cfg *c, const RepTab *hist, const Tree *t,
+                         int start, Gen *g, float *tv)
+{
+    int stm = p->turn;
+    if (!p->royals[stm])     { *tv = -1.0f; return 1; }
+    if (!p->royals[1 - stm]) { *tv =  1.0f; return 1; }     /* the mover swept its own King */
+    gen_all(p, g);
+    if (!g->n) { *tv = c->stalemate_loses ? -1.0f : 0.0f; return c->stalemate_loses ? 1 : 2; }
+    if (c->regicide) {
+        king_ctx_set(g, p);
+        if (find_king_capture(g)) { *tv = 1.0f; return 1; }
+    }
+    if (c->rep_limit > 0) {
+        int k = rep_peek(hist, p->hash) + 1;
+        for (int i = start + 1; i < t->npath - 1; i++) k += t->nd[t->path[i]].h == p->hash;
+        if (k >= c->rep_limit) { *tv = 0.0f; return 2; }
+    }
+    return 0;
+}
+
+static void batch_reserve(Batch *b, int boards, int rows)
+{
+    if (b->nb + boards + 1 > b->cb) {
+        b->cb = (b->nb + boards + 1) * 2;
+        b->boards = realloc(b->boards, (size_t)b->cb * NSQ * sizeof(int32_t));
+        b->val  = realloc(b->val,  (size_t)b->cb * sizeof(float));
+        b->tr   = realloc(b->tr,   (size_t)b->cb * sizeof(Tree *));
+        b->leaf = realloc(b->leaf, (size_t)b->cb * sizeof(int));
+        b->roff = realloc(b->roff, (size_t)b->cb * sizeof(int));
+    }
+    if (b->nr + rows > b->cr) {
+        b->cr = (b->nr + rows) * 2;
+        b->rows = realloc(b->rows, (size_t)b->cr * 4 * sizeof(int32_t));
+        b->lgt  = realloc(b->lgt,  (size_t)b->cr * sizeof(float));
+    }
+    if (!b->boards || !b->val || !b->tr || !b->leaf || !b->roff || !b->rows || !b->lgt) {
+        fprintf(stderr, "oom in the search batch\n");
+        exit(1);
+    }
+}
+
+/* Queues node s at position p, whose legal moves are in g, for the network. */
+static void tree_queue(Tree *t, Batch *b, int s, const Pos *p, const Gen *g, int start)
+{
+    int k = t->np++, n = g->n;
+    t->pnode[k] = s; t->poff[k] = start; t->plen[k] = t->npath - start;
+    t->pmv = grow(t->pmv, &t->cpmv, t->npmv + n, sizeof(uint32_t));
+    t->pmoff[k] = t->npmv; t->pmcnt[k] = n;
+    memcpy(t->pmv + t->npmv, g->buf, (size_t)n * sizeof(uint32_t));
+    t->npmv += n;
+
+    batch_reserve(b, 1, n);
+    int i = b->nb++;
+    encode_stm(p, b->boards + (size_t)i * NSQ);
+    b->tr[i] = t; b->leaf[i] = k; b->roff[i] = b->nr;
+    int flip = p->turn != SIDE_BLACK;              /* encode_stm rotates white to move */
+    int32_t *r = b->rows + (size_t)b->nr * 4;
+    for (int j = 0; j < n; j++, r += 4) {
+        uint32_t v = g->buf[j];
+        int o = UNPACK_O(v), mv = UNPACK_M(v), sp = mv / 1296, to = mv % 1296;
+        if (flip) {
+            o = NSQ - 1 - o;
+            to = NSQ - 1 - to;
+            if (sp >= 1 && sp <= 8) sp = (sp - 1 + 4) % 8 + 1;   /* DIRS[i] -> DIRS[i+4] */
+        }
+        r[0] = i; r[1] = o; r[2] = to; r[3] = sp;
+    }
+    b->nr += n;
+    t->nd[s].pend = 1;
+    t->evals++;
+}
+
+/* One simulation: 0 finished on a terminal, 1 queued a leaf, 2 ran into a pending one, 3
+ * pruned a move that hangs the King and counts for nothing. */
+static int tree_walk(Tree *t, const Cfg *c, const RepTab *hist, Gen *g, Batch *b)
+{
+    Pos *p = &t->walk;
+    memcpy(p, &t->pos, sizeof(Pos));
+    int start = t->npath, s = t->root;
+    path_push(t, s);
+    t->nd[s].n++; t->nd[s].vl++;
+    for (;;) {
+        Node *nd = &t->nd[s];
+        if (nd->term) {
+            tree_backup(t, start, t->npath - start, terminal_value(t, nd, t->npath - 1 - start));
+            t->npath = start;
+            return 0;
+        }
+        if (nd->pend) { tree_undo(t, start, t->npath - start); t->npath = start; return 2; }
+        if (!nd->ne) {                                   /* the fresh root */
+            gen_all(p, g);
+            tree_queue(t, b, s, p, g, start);
+            return 1;
+        }
+        Edge *e = &t->ed[nd->e0 + tree_select(t, s, c->cpuct)];
+        do_move(p, SQ2P[UNPACK_O(e->mv)], UNPACK_M(e->mv));
+        int ch = e->c, fresh = ch < 0;
+        if (fresh) ch = e->c = tree_node(t, p->hash);    /* t->nd may move; t->ed does not */
+        path_push(t, ch);
+        Node *cn = &t->nd[ch];
+        cn->n++; cn->vl++; cn->w -= 1.0f;
+        if (fresh) {
+            float tv;
+            int r = leaf_terminal(p, c, hist, t, start, g, &tv);
+            if (r == 1 && tv > 0.0f && c->king_safety) {
+                tree_undo(t, start, t->npath - start);
+                t->npath = start;
+                e->c = PRUNED;
+                Node *pn = &t->nd[s];
+                if (++pn->npr == pn->ne) { pn->term = 1; pn->tv = -1.0f; }
+                return 3;
+            }
+            if (r) {
+                cn->term = (int8_t)r; cn->tv = tv;
+                tree_backup(t, start, t->npath - start, terminal_value(t, cn, t->npath - 1 - start));
+                t->npath = start;
+                return 0;
+            }
+            tree_queue(t, b, ch, p, g, start);
+            return 1;
+        }
+        s = ch;
+    }
+}
+
+/* Up to `leaves` walks; terminals are backed up on the spot. */
+static void tree_gather(Tree *t, const Cfg *c, const RepTab *hist, Gen *g, Batch *b)
+{
+    int collisions = 0;
+    while (t->np < c->leaves && t->todo > t->np && collisions < c->leaves) {
+        int r = tree_walk(t, c, hist, g, b);
+        if (r == 0) t->todo--;
+        else if (r == 2) collisions++;
+    }
+}
+
+/* Leaf k of tree t back from the network: its edges, then the value up its path. */
+static void tree_expand(Tree *t, int k, float v, const float *lg)
+{
+    int s = t->pnode[k], n = t->pmcnt[k];
+    t->ed = grow(t->ed, &t->cne, t->ne + n, sizeof(Edge));
+    int e0 = t->ne;
+    t->ne += n;
+    float mx = lg[0];
+    for (int i = 1; i < n; i++) if (lg[i] > mx) mx = lg[i];
+    double sum = 0.0;
+    for (int i = 0; i < n; i++) sum += t->ed[e0 + i].p = expf(lg[i] - mx);
+    for (int i = 0; i < n; i++) {
+        t->ed[e0 + i].p = (float)(t->ed[e0 + i].p / sum);
+        t->ed[e0 + i].mv = t->pmv[t->pmoff[k] + i];
+        t->ed[e0 + i].c = -1;
+    }
+    Node *nd = &t->nd[s];
+    nd->e0 = e0; nd->ne = n; nd->v = v; nd->pend = 0;
+    if (s == t->root) tree_contempt(t);
+    if (s == t->root && t->noise) tree_noise(t);
+    tree_backup(t, t->poff[k], t->plen[k], v);
+    t->todo--;
+}
+
+/* One network call per sub-batch, then every leaf back into its tree. Row board indices
+ * are rebased per sub-batch. */
+static double batch_run(Net *net, Batch *b)
+{
+    if (!b->nb) return 0.0;
+    double t0 = now_s();
+    b->roff[b->nb] = b->nr;
+    for (int at = 0; at < b->nb; ) {
+        int nb = b->nb - at < net->sub_batch ? b->nb - at : net->sub_batch;
+        int r0 = b->roff[at], r1 = b->roff[at + nb];
+        for (int r = r0; r < r1; r++) b->rows[(size_t)r * 4] -= at;
+        ORT_CHECK(net_run_raw(net, b->boards + (size_t)at * NSQ, nb, b->rows + (size_t)r0 * 4,
+                              r1 - r0, b->val + at, b->lgt + r0));
+        at += nb;
+    }
+    double dt = now_s() - t0;
+    for (int i = 0; i < b->nb; i++) tree_expand(b->tr[i], b->leaf[i], b->val[i], b->lgt + b->roff[i]);
+    for (int i = 0; i < b->nb; i++) { Tree *t = b->tr[i]; t->np = 0; t->npath = 0; t->npmv = 0; }
+    b->nb = b->nr = 0;
+    return dt;
+}
+
+/* The move to play, as a root edge: visits ** (1 / T), T = 0 the most visited (ties to
+ * the higher Q). King safety on top: a pick that hangs the King is struck out and the
+ * draw repeated, which is exactly the distribution restricted to the safe moves; if every
+ * visited move hangs, the unvisited are tried in prior order. *q gets the child's mean
+ * value for the side then to move. */
+static int tree_pick(Tree *t, Scratch *s, Rng *rng, double T, int king_safety, int *changed,
+                     float *q)
+{
+    const Node *r = &t->nd[t->root];
+    scratch_reserve(s, r->ne);
+    int live = 0, k = -1;
+    for (int i = 0; i < r->ne; i++) {
+        const Edge *e = &t->ed[r->e0 + i];
+        if (e->c >= 0 && t->nd[e->c].n > 0) s->perm[live++] = i;
+    }
+    *changed = 0;
+    uint64_t before = s->checks;
+    while (live > 0) {
+        int nmax = 0;
+        for (int j = 0; j < live; j++) {
+            int n = t->nd[t->ed[r->e0 + s->perm[j]].c].n;
+            if (n > nmax) nmax = n;
+        }
+        if (T <= 0.0) {
+            double bq = -1e30;
+            for (int j = 0; j < live; j++) {
+                const Node *c = &t->nd[t->ed[r->e0 + s->perm[j]].c];
+                if (c->n == nmax && c->w / c->n > bq) { bq = c->w / c->n; k = j; }
+            }
+        } else {
+            double sum = 0.0;
+            for (int j = 0; j < live; j++)
+                sum += s->weights[j] = exp(log((double)t->nd[t->ed[r->e0 + s->perm[j]].c].n / nmax) / T);
+            double x = unif(rng) * sum;
+            for (k = 0; k < live - 1 && (x -= s->weights[k]) > 0.0; k++) { }
+        }
+        if (!king_safety || !hangs_king(s, &t->pos, t->ed[r->e0 + s->perm[k]].mv)) break;
+        s->perm[k] = s->perm[--live];
+        k = -1;
+    }
+    int e;
+    if (k >= 0) {
+        e = s->perm[k];
+    } else {                                    /* every visited move hangs the King */
+        e = -1;
+        for (int i = 0; i < r->ne; i++) s->perm[i] = i;
+        for (int i = 0; i < r->ne && e < 0; i++) {
+            int bi = i;
+            for (int j = i + 1; j < r->ne; j++)
+                if (t->ed[r->e0 + s->perm[j]].p > t->ed[r->e0 + s->perm[bi]].p) bi = j;
+            int tmp = s->perm[i]; s->perm[i] = s->perm[bi]; s->perm[bi] = tmp;
+            if (!hangs_king(s, &t->pos, t->ed[r->e0 + s->perm[i]].mv)) e = s->perm[i];
+        }
+        if (e < 0) {                            /* nothing saves it: the most visited */
+            s->hopeless++;
+            int nmax = -1;
+            for (int i = 0; i < r->ne; i++) {
+                int c = t->ed[r->e0 + i].c, n = c >= 0 ? t->nd[c].n : 0;
+                if (n > nmax) { nmax = n; e = i; }
+            }
+        }
+    }
+    *changed = king_safety && s->checks - before > 1;
+    s->overridden += *changed;
+    int c = t->ed[r->e0 + e].c;
+    *q = c >= 0 && t->nd[c].n > 0 ? -t->nd[c].w / t->nd[c].n : -r->v;
+    return e;
+}
+
+/* The root's visited children, for .kids version 2. */
+static void tree_kids(const Tree *t, Bytes *x, Scratch *s)
+{
+    const Node *r = &t->nd[t->root];
+    scratch_reserve(s, r->ne);
+    uint32_t *mv = (uint32_t *)s->mv4;
+    int n = 0;
+    for (int i = 0; i < r->ne; i++) {
+        const Edge *e = &t->ed[r->e0 + i];
+        if (e->c < 0 || t->nd[e->c].n <= 0) continue;
+        mv[n] = e->mv;
+        s->perm[n] = t->nd[e->c].n;
+        s->values[n] = -t->nd[e->c].w / t->nd[e->c].n;
+        n++;
+    }
+    kids_ply(x, mv, NULL, s->values, s->perm, n);
+}
+
+/* The move was played and p is the new position: keep the subtree below it, compacted. */
+static void tree_advance(Tree *t, uint32_t mv, const Pos *p)
+{
+    const Node *r = &t->nd[t->root];
+    int ch = -1;
+    for (int i = 0; i < r->ne; i++)
+        if (t->ed[r->e0 + i].mv == mv) { ch = t->ed[r->e0 + i].c; break; }
+    if (ch < 0 || t->nd[ch].term || !t->nd[ch].ne) { tree_reset(t, p); return; }
+    Node *nd = malloc(sizeof(Node) * (size_t)t->cn);
+    Edge *ed = malloc(sizeof(Edge) * (size_t)t->cne);
+    if (!nd || !ed) { fprintf(stderr, "oom in the search\n"); exit(1); }
+    int nn = 1, ne = 0;
+    nd[0] = t->nd[ch];
+    for (int head = 0; head < nn; head++) {      /* breadth first, renumbering as it goes */
+        Node *x = &nd[head];
+        int e0 = ne;
+        for (int i = 0; i < x->ne; i++) {
+            Edge e = t->ed[x->e0 + i];
+            if (e.c >= 0) { nd[nn] = t->nd[e.c]; e.c = nn++; }
+            ed[ne++] = e;
+        }
+        x->e0 = e0;
+    }
+    free(t->nd); free(t->ed);
+    t->nd = nd; t->ed = ed; t->nn = nn; t->ne = ne;
+    t->root = 0;
+    memcpy(&t->pos, p, sizeof(Pos));
+}
+
 static const char USAGE[] =
-    "usage: nnplay <play|elo|variance|subsample|selfcheck|eval|encode> [options]\n"
+    "usage: nnplay <play|elo|variance|selfcheck|eval|encode> [options]\n"
     "  play    self-play games and write a .tkn shard\n"
     "    --out FILE          where to write (omit to play without recording)\n"
-    "    --games N           games to play (default 1)\n"
+    "    --games N           games to keep (default 1)\n"
     "    --positions N       play whole games until at least N positions are written,\n"
-    "                        however many games that takes. The last game is finished\n"
-    "                        rather than cut short, so the count overshoots a little and\n"
-    "                        every game keeps a real result. With --games as well, that\n"
-    "                        becomes a cap on the number of games.\n"
+    "                        however many games that takes. Games in play when it is\n"
+    "                        reached are finished, so the count overshoots by up to\n"
+    "                        --parallel-games games, and every game keeps a real result.\n"
+    "                        With --games as well, that becomes a cap on the games.\n"
     "    --first-game N      index of the first game, so shards can be split across runs\n"
-    "    --temperature T     softmax temperature over the negated leaf values (default 1.0,\n"
-    "                        0 is greedy)\n"
-    "    --max-plies N       ply cap, scored as a draw (default 3000)\n"
+    "    --sims N            simulations of the search per move (default 128). 0 is the\n"
+    "                        one-ply search: the value head scores the children of the\n"
+    "                        policy's top 5% of the moves plus 2% at random\n"
+    "    --temperature T     the move is drawn by visits^(1/T) after a search, or by a\n"
+    "                        softmax over the children's values at --sims 0 (default 1.0;\n"
+    "                        0 plays the most visited, or the best scored)\n"
+    "    --opening-plies N   play the first N plies at --opening-temperature, then switch\n"
+    "                        to --temperature (default 0: one temperature all game)\n"
+    "    --opening-temperature T   temperature for those plies (default 1.0)\n"
+    "    --leaves N          leaves a tree gathers, under virtual loss, before the network\n"
+    "                        sees them (default 8)\n"
+    "    --parallel-games N  games played in lockstep, their leaves sharing each network\n"
+    "                        call (default 32)\n"
+    "    --cpuct C           exploration constant, on min-max normalised Q (default 1.25)\n"
+    "    --noise-frac F      share of Dirichlet noise in the root's priors (default 0.25,\n"
+    "                        0 disables)...\n"
+    "    --noise-alpha A     ...with alpha = A / legal moves (default 10)\n"
+    "    --contempt C        in the search, a draw (repetition, or stalemate with\n"
+    "                        stalemate a draw) is worth -C * sigmoid(20 * (v_root - 0.1))\n"
+    "                        to the side searching, v_root the network's value of the\n"
+    "                        root: a side that thinks it is ahead avoids draws (default\n"
+    "                        0.1, 0 off; elo applies it to both sides). play makes it\n"
+    "                        flat: a draw is worth -C to the side searching, always\n"
+    "    --max-plies N       ply cap (default 3000)\n"
     "    --rep-limit N       repetition limit (default 4, 0 disables)\n"
     "    --no-progress N     plies without a capture or promotion before a draw (0 disables)\n"
     "    --no-regicide       do not force an available King capture\n"
@@ -1486,37 +2137,39 @@ static const char USAGE[] =
     "                        cannot end a game\n"
     "    --cap-draw          score the ply cap as a draw. By default it goes to the side\n"
     "                        ahead on material, and is a draw under a 50-pawn lead\n"
-    "    --policy-top F      the value head scores the policy's top F of the legal moves\n"
-    "                        (default 0.05)...\n"
-    "    --policy-explore F  ...plus F more drawn at random from the rest (default 0.02), so\n"
-    "                        the policy's misses still get evaluated and, with --children,\n"
-    "                        recorded for the next policy to learn from. Needs the policy\n"
-    "                        graph beside the value graph (net_fp16_policy.onnx);\n"
-    "                        --policy-model FILE names another\n"
-
-    "    --opening-plies N   play the first N plies at --opening-temperature, then switch\n"
-    "                        to --temperature. 0 (default) keeps one temperature all game.\n"
-    "                        A hot opening buys diversity; a cool middlegame makes the\n"
-    "                        result follow from the position instead of from luck.\n"
-    "    --opening-temperature T   temperature for those plies (default 1.0)\n"
-    "    --children FILE     also write every child the search scored, with its value,\n"
-    "                        to a .kids side file paired with --out. About 2 KB a\n"
-    "                        position; it is what policy training learns from\n"
+    "    --selfplay-soft-target-scale S   label a game cut off by the ply cap or by\n"
+    "                        repetition S * tanh(material / 300 pawns) for training, black's\n"
+    "                        view, instead of its result (default 0.75, 0 off). The result\n"
+    "                        itself, and so the reported score, is unchanged\n"
+    "    --drop-capped       write no game that reached the ply cap, to the .tkn or the\n"
+    "                        .kids. --games and --positions then count the games and\n"
+    "                        positions written, so the run plays more than that\n"
+    "    --endgames          start every game from a random sparse position with a\n"
+    "                        material lead, and keep only games won by capturing the King.\n"
+    "                        Adjudication is off: no resignation, and a capped game is\n"
+    "                        dropped like any other non-royal ending\n"
+    "    --endgames-max-pieces N   fewer than N pieces in all, Kings included (default 20)\n"
+    "    --endgames-imbalance P    the side ahead leads by at least P pawns and holds a\n"
+    "                        ranging piece (default 50). A draw that misses is redrawn;\n"
+    "                        101 misses in a row stops the run as unsatisfiable\n"
+    "    --children FILE     also write what the search saw at every ply to a .kids side\n"
+    "                        file paired with --out: the visited root children with their\n"
+    "                        visits and values, or at --sims 0 every scored child. It is\n"
+    "                        what policy training learns from\n"
     "    --seed S            base seed. Default: a fresh random one every run, printed at\n"
     "                        start and stored in the file header, so sessions never\n"
     "                        replay each other's games and any run can still be repeated\n"
     "  elo     rate the network against a baseline anchored at 0. Colours alternate and\n"
-    "          regicide is forced for both sides. --temperature defaults to 0 here\n"
-    "          (playing strength) rather than the sampling policy's value -- or to\n"
-    "          0.3 with --out, since the games are then kept as training data.\n"
+    "          regicide is forced for both sides. No root noise, and --temperature\n"
+    "          defaults to 0 (the most visited move) -- or to 0.3 with --out, since the\n"
+    "          games are then kept as training data. --sims, --leaves, --parallel-games\n"
+    "          and --cpuct as for play\n"
     "    --baseline FILE     opponent graph, default baseline_<precision>.onnx, which\n"
-    "                        export_onnx.py writes from baseline.pt\n"
+    "                        export_onnx.py writes from baseline.pt. The bot's own graph\n"
+    "                        plays the net against itself, e.g. at different --sims\n"
     "    --baseline random   the uniform mover instead: an absolute anchor, but it stops\n"
     "                        discriminating once the bot beats it every game\n"
-    "    --vs-full           rate the cost of the policy pruning: the net plays itself, the\n"
-    "                        rated side scoring the policy's picks and its opponent every\n"
-    "                        child. Needs no baseline graph. A baseline graph must itself\n"
-    "                        have a policy graph beside it\n"
+    "    --baseline-sims N   the opponent's simulations per move (default: --sims)\n"
     "    --sprt E0,E1        sequential test, on by default at 0,50: stop as soon as the\n"
     "                        games show the bot is at least E1 better than the baseline\n"
     "                        (H1) or at most E0 (H0), in logistic Elo -- the rating a score\n"
@@ -1524,31 +2177,23 @@ static const char USAGE[] =
     "    --alpha A, --beta B the test's error rates, default 0.05 each\n"
     "    --games N           with SPRT, the most games before stopping undecided\n"
     "                        (default 1000); with --no-sprt, the exact number to play\n"
-    "    --no-sprt           play exactly --games games, the old behaviour\n"
+    "    --no-sprt           play exactly --games games\n"
     "    --out FILE          also keep every position, in the same .tkn as self-play. Each\n"
     "                        ply's value is the rated net's; the opponent's moves are\n"
     "                        flagged (32 in the ply flags)\n"
-    "  variance   the ceiling on what any value head could learn from this generator.\n"
-    "          Snapshots positions along a game and replays each many times, so the\n"
-    "          outcome variance splits into the part the position decides and the part\n"
-    "          decided by luck afterwards. Use it to compare temperature schedules.\n"
+    "  variance   the ceiling on what any value head could learn from this generator,\n"
+    "          with the one-ply search. Snapshots positions along a game and replays each\n"
+    "          many times, so the outcome variance splits into the part the position\n"
+    "          decides and the part decided by luck afterwards.\n"
     "    --branch-every N    snapshot every N plies, from a random phase per game so\n"
     "                        every ply is equally likely (default 100, 0 disables)\n"
     "    --branches K        playouts from each snapshot (default 8, minimum 2)\n"
     "    --max-points N      at most N snapshots per game (0 = no limit)\n"
     "    --csv FILE          one row per branch point\n"
-    "  subsample  how much value is lost by scoring only a fraction of the children at\n"
-    "          each position. Plays self-play games, and at every position compares the\n"
-    "          best child found in a random subset against the best over all of them.\n"
-    "    --proportions L     comma-separated fractions (default 0.01,0.02,0.05,0.1,0.25,0.5)\n"
-    "    --repeats N         random subsets per position per fraction (default 8)\n"
-    "    --stride N          measure every Nth ply (default 1)\n"
-    "    --csv FILE          one row per position, fraction and repeat\n"
-    "    --verify N          re-run N subsets as their own GPU batch as a cross-check\n"
     "  safetytest  check the King-safety rule against tky.c's slow detector; no GPU\n"
-    "  selfcheck  prove the setup: the CUDA provider loads, the start position evaluates\n"
-    "          to the value export_onnx.py recorded in net_manifest.json, and the probe\n"
-    "          reports this GPU's throughput. Exit 0 only if all of that holds.\n"
+    "  selfcheck  prove the setup: the CUDA provider loads, the start position's value and\n"
+    "          policy match what export_onnx.py recorded in net_manifest.json, and the\n"
+    "          probe reports this GPU's throughput. Exit 0 only if all of that holds.\n"
     "  eval    values for boards read from stdin: whitespace ints, 1296 per board\n"
     "  encode  encode_stm for a position read from stdin, for the canonicalisation test\n"
     "\n  --model FILE / --precision fp16|fp32   which graph to run (default fp16)\n"
@@ -1560,9 +2205,9 @@ static const char USAGE[] =
     "  --no-tf32             full fp32 matmuls instead of TF32; only meaningful with\n"
     "                        --precision fp32, where it is what closes the last ~1e-3\n"
     "                        against torch\n"
-    "  --progress-every N    a line every N plies within a game (default 25, 0 off)\n"
-    "  --stats               add where each ply's wall clock went, and GPU utilisation\n"
-    "                        sampled from NVML at 10 Hz if libnvidia-ml is present\n"
+    "  --progress-every S    a status line every S seconds (default 30, 0 off)\n"
+    "  --stats               add GPU utilisation to the status lines, sampled from NVML\n"
+    "                        at 10 Hz if libnvidia-ml is present\n"
     "  --quiet               no progress output at all\n";
 
 /* Reads a position as `clear`, `turn N` and `sq idx colour promoted` lines, and prints
@@ -1743,547 +2388,495 @@ static int mode_eval(Net *net)
     return 0;
 }
 
-/* Bot versus a uniformly random mover. Regicide is forced for both sides, exactly as in
- * self-play, so games end at a few hundred plies instead of running forever. Colours
- * alternate so the first-move advantage is measured rather than absorbed into the rating.
- */
-static int mode_elo(Net *net, Net *opp, const char *opp_name, Cfg *cfg,
-                    uint64_t games, int first_game, const Pick *bot_pk, const Pick *opp_pk,
-                    const Sprt *sprt, const char *model)
+/* ---- games: self-play and elo share one loop ------------------------------------ */
+/* games_par games run in lockstep. Each round, every game whose mover searches walks its
+ * tree for up to `leaves` leaves; the leaves of all games go to the network in one call
+ * per net; then every game whose search is done plays its move. Moves that need no search
+ * -- a forced King capture, the one-ply search, the uniform mover -- are played as soon as
+ * they come up. Games end at different times and their slots start new ones, so a file's
+ * games come out in the order they finish.
+ *
+ * A player picks one side's moves: a network with its search (sims > 0) or the one-ply
+ * search (sims 0), or the uniform mover (net NULL). Self-play has one player and one tree
+ * per game, shared by both sides. elo has the rated net and its opponent, each with its
+ * own tree per game, and both trees follow every move so each stays rooted at the game. */
+typedef struct { Net *net; int sims; double noise; Batch batch; } Player;
+
+typedef struct {
+    int       on, searching, n_legal;
+    uint64_t  gi, seed;
+    Rng       rng;
+    Pos       pos;
+    RepTab   *rep;
+    PlyRecNN *ply;
+    int       nply, no_prog, lead_run, bot_side;
+    Tree      tree[2];
+    Bytes     kids;
+    double    t0;
+} Slot;
+
+typedef struct {
+    Cfg      *cfg;
+    int       elo;
+    Player    pl[2];
+    Slot     *sl;
+    Scratch   sc;
+    Gen       wg;               /* move lists for tree walks */
+    Pos       base;
+    Sink      sink;
+    Kids      kids;
+    int       kids_on, mat_div;
+    uint64_t  games, target_positions, started, games_done, plies, kept_games, kept_plies;
+    uint64_t  wins[3], evals[2], moves[2];
+    int       games_set, first_game, stop, eg_failed;
+    EgStats   eg;
+    double    t_start, t_nn, t_status;
+    uint64_t  calls, call_boards;
+    /* elo */
+    const char *opp_name;
+    const Sprt *sprt;
+    Rec       as_black, as_white;
+    EloFit    fit;
+    double   *marg, llr;
+    int       verdict;
+} Run;
+
+static void game_start(Run *R, Slot *s)
 {
-    Pos *base = malloc(sizeof(Pos)), *p = malloc(sizeof(Pos));
-    pos_init(base);
-    Scratch sc;
-    scratch_init(&sc);
-    Gen *g = &sc.g;
-    RepTab *rep = calloc(1, sizeof(RepTab));
-    double *marg = malloc(sizeof(double) * ELO_N);
-    double bot_evals = 0, opp_evals = 0, bot_plies = 0, opp_plies = 0;
-
-    Rec as_black = { 0, 0, 0 }, as_white = { 0, 0, 0 };
-    EloFit fit = { 0, 0, 0, 0, 0, 0 };
-    double llr = 0.0;
-    int verdict = 0;                   /* SPRT: 1 H1 accepted, -1 H0 accepted, 0 undecided */
-
-    /* --out keeps the match's positions, in the same .tkn as self-play. Every ply's value
-     * is the rated net's, whoever moved, so the file holds one network's opinions like a
-     * self-play file does; moves by the baseline or the random mover carry PF_OPPONENT. */
-    Sink sink = { -1, NULL, 0, 1u << 22 };
-    PlyRecNN *plybuf = NULL;
-    uint64_t games_written = 0;
-    int mat_div = VALUE_FP >> cfg->mat_shift;
-    if (mat_div < 1) mat_div = 1;
-    if (cfg->out_path) {
-        if (tkn_open(&sink, cfg, net, model)) return 1;
-        plybuf = malloc(sizeof(PlyRecNN) * (size_t)(cfg->max_plies + 2));
-        fprintf(stderr, "writing every position to %s\n", cfg->out_path);
+    const Cfg *c = R->cfg;
+    s->gi = R->started++;
+    s->seed = c->seed_base ^ (((uint64_t)R->first_game + s->gi) * 0x9E3779B97F4A7C15ull);
+    rng_seed(&s->rng, s->seed);
+    if (!c->endgames) memcpy(&s->pos, &R->base, sizeof(Pos));
+    else if (eg_generate(&s->pos, c, &s->rng, &R->sc.g, &R->eg)) {
+        fprintf(stderr,
+            "--endgames: %d random positions in a row failed the requirements (so far %llu "
+            "short of a %d-pawn lead held by a side with a ranging piece, %llu with a King "
+            "capturable at once), so they look unsatisfiable with fewer than %d pieces. "
+            "Raise --endgames-max-pieces or lower --endgames-imbalance.\n",
+            EG_MAX_FAILS + 1, (unsigned long long)R->eg.short_lead, c->eg_imbalance,
+            (unsigned long long)R->eg.king_hangs, c->eg_max_pieces);
+        R->eg_failed = R->stop = 1;
+        return;
     }
-    double t_start = now_s();
-    uint64_t plies_total = 0;
+    s->rep->epoch++;
+    rep_bump(s->rep, s->pos.hash);
+    s->nply = s->no_prog = s->lead_run = s->searching = 0;
+    s->bot_side = (s->gi & 1) ? SIDE_WHITE : SIDE_BLACK;    /* elo: alternate who moves first */
+    tree_reset(&s->tree[0], &s->pos);
+    tree_reset(&s->tree[1], &s->pos);
+    s->kids.len = 0;
+    s->t0 = now_s();
+    s->on = 1;
+}
 
-    fprintf(stderr, "bot vs %s, regicide forced, king safety %s, temperature %.3g%s\n",
-            opp_name, cfg->king_safety ? "on (both sides)" : "off",
-            cfg->temperature, cfg->temperature == 0.0 ? " (greedy)" : "");
+static int may_start(const Run *R)
+{
+    if (R->stop) return 0;
+    if (R->elo) return R->started < R->games;
+    uint64_t in_play = R->started - R->games_done;
+    if (R->target_positions)
+        return R->kept_plies < R->target_positions && !(R->games_set && R->kept_games + in_play >= R->games);
+    return R->kept_games + in_play < R->games;
+}
+
+static void game_end(Run *R, Slot *s, int result, int term)
+{
+    const Cfg *c = R->cfg;
+    static const char *tn[] = { "royal", "stalemate", "repetition", "no-progress", "ply-cap",
+                                "resignation" };
+    s->on = 0;
+    R->games_done++;
+    R->plies += (uint64_t)s->nply;
+    R->wins[result]++;
+    if (!R->elo) {
+        int keep = c->endgames ? term == TERM_ROYAL : !(c->drop_capped && term == TERM_PLYCAP);
+        if (keep) {
+            R->kept_games++;
+            R->kept_plies += (uint64_t)s->nply;
+            if (R->kids_on) kids_game(&R->kids, &s->kids, s->ply, s->nply, s->seed);
+            if (c->out_path)
+                tkn_put_game(&R->sink, s->ply, s->nply, result, term,
+                             soft_label(c, &s->pos, result, term), s->seed);
+        }
+        if (!c->verbose) return;
+        char head[96], eta[48] = "";
+        if (R->target_positions)
+            snprintf(head, sizeof(head), "Game %llu, Positions %llu/%llu",
+                     (unsigned long long)R->games_done, (unsigned long long)R->kept_plies,
+                     (unsigned long long)R->target_positions);
+        else
+            snprintf(head, sizeof(head), "Game %llu, Kept %llu/%llu",
+                     (unsigned long long)R->games_done, (unsigned long long)R->kept_games,
+                     (unsigned long long)R->games);
+        double el = now_s() - R->t_start, remain = 0.0;
+        if (R->target_positions && R->kept_plies && R->kept_plies < R->target_positions)
+            remain = el / (double)R->kept_plies * (double)(R->target_positions - R->kept_plies);
+        else if (!R->target_positions && R->kept_games && R->kept_games < R->games)
+            remain = el / (double)R->kept_games * (double)(R->games - R->kept_games);
+        if (remain > 0.0) {
+            char d[32];
+            fmt_dur(remain, d, sizeof(d));
+            snprintf(eta, sizeof(eta), "  ETA %s", d);
+        }
+        fprintf(stderr, "%s (index %llu): %d plies, %s by %s, %.1fs%s%s\n",
+                head, (unsigned long long)(R->first_game + s->gi), s->nply,
+                result == RES_BLACK ? "black" : result == RES_WHITE ? "white" : "draw",
+                tn[term], now_s() - s->t0, eta, keep ? "" : "  (dropped)");
+        return;
+    }
+    if (c->out_path)
+        tkn_put_game(&R->sink, s->ply, s->nply, result, term, soft_label(c, &s->pos, result, term),
+                     s->seed);
+    Rec *r = (s->bot_side == SIDE_BLACK) ? &R->as_black : &R->as_white;
+    static const char *why[] = { "king", "stalemate", "repetition", "no progress", "ply cap",
+                                 "adjudication" };
+    const char *tag;
+    if (result == RES_DRAW)          { r->d++; tag = "draw"; }
+    else if (result == s->bot_side)  { r->w++; tag = "win"; }
+    else                             { r->l++; tag = "loss"; }
+    elo_fit(&R->as_black, &R->as_white, R->marg, &R->fit);
+    long wins = R->as_black.w + R->as_white.w, losses = R->as_black.l + R->as_white.l,
+         draws = R->as_black.d + R->as_white.d;
+    double n = (double)(wins + losses + draws);
+    char sp[48] = "";
+    if (R->sprt->on) {
+        R->llr = sprt_llr(wins, draws, losses, R->sprt->elo0, R->sprt->elo1);
+        R->verdict = sprt_decide(R->sprt, R->llr);
+        snprintf(sp, sizeof(sp), " | LLR %+.2f [%.2f, %.2f]", R->llr, R->sprt->lower, R->sprt->upper);
+    }
+    fprintf(stderr,
+        "game %-4llu bot=%-5s %-4s by %-12s in %4d plies (%5.1fs) | %4ldW %4ldL %4ldD  score %.3f | "
+        "elo %+6.0f [%+.0f, %+.0f]%s | first-move %+.0f%s | %.1f min elapsed\n",
+        (unsigned long long)(R->first_game + s->gi), s->bot_side == SIDE_BLACK ? "black" : "white",
+        tag, why[term], s->nply, now_s() - s->t0, wins, losses, draws, (wins + 0.5 * draws) / n,
+        R->fit.elo, R->fit.lo, R->fit.hi, R->fit.saturated ? " (at the grid edge)" : "",
+        R->fit.advantage, sp, (now_s() - R->t_start) / 60.0);
+    if (R->verdict) R->stop = 1;
+}
+
+/* Plays mv in slot s. value is for the side to move after it; scored, the network
+ * evaluations the move cost. */
+static void game_move(Run *R, Slot *s, uint32_t mv, float value, int scored, int flags)
+{
+    const Cfg *c = R->cfg;
+    Pos *p = &s->pos;
+    int mover = p->turn, rb[2] = { p->royals[0], p->royals[1] }, before = p->npieces;
+    int pi = R->elo && mover != s->bot_side;
+    R->evals[pi] += (uint64_t)scored;
+    R->moves[pi]++;
+    int promoted = do_move(p, SQ2P[UNPACK_O(mv)], UNPACK_M(mv));
+    int captured = before - p->npieces;
+    if (pi && c->out_path && !(flags & PF_FORCED_KING)) {   /* the rated net's view, always */
+        scratch_reserve(&R->sc, 1);
+        encode_stm(p, R->sc.boards);
+        net_eval(R->pl[0].net, R->sc.boards, 1, &value);
+    }
+    tkn_fill(&s->ply[s->nply], p, mv, value, s->n_legal, mover,
+             flags | (captured > 0 ? PF_CAPTURE : 0) | (promoted ? PF_PROMOTION : 0)
+             | (pi ? PF_OPPONENT : 0), scored, R->mat_div);
+    s->nply++;
+    s->no_prog = (captured > 0 || promoted) ? 0 : s->no_prog + 1;
+    tree_advance(&s->tree[0], mv, p);
+    if (R->elo) tree_advance(&s->tree[1], mv, p);
+
+    int result = -1, term = 0, adj;
+    if (p->royals[1 - mover] < rb[1 - mover])      { result = mover;     term = TERM_ROYAL; }
+    else if (p->royals[mover] < rb[mover])         { result = 1 - mover; term = TERM_ROYAL; }
+    else {
+        int seen = rep_bump(s->rep, p->hash);
+        if (c->rep_limit > 0 && seen >= c->rep_limit)                       { result = RES_DRAW; term = TERM_REPETITION; }
+        else if (c->no_progress_limit > 0 && s->no_prog >= c->no_progress_limit) { result = RES_DRAW; term = TERM_NOPROGRESS; }
+        else if ((adj = resign_check(c, p, &s->lead_run)) >= 0)              { result = adj;      term = TERM_RESIGN; }
+    }
+    if (result >= 0) game_end(R, s, result, term);
+}
+
+/* The start of a move: the game may already be over, the move may need no search, or a
+ * search begins. */
+static void game_decide(Run *R, Slot *s)
+{
+    const Cfg *c = R->cfg;
+    Scratch *sc = &R->sc;
+    Pos *p = &s->pos;
+    gen_all(p, &sc->g);
+    s->n_legal = sc->g.n;
+    if (!sc->g.n) { game_end(R, s, c->stalemate_loses ? 1 - p->turn : RES_DRAW, TERM_STALEMATE); return; }
+    if (s->nply >= c->max_plies) { game_end(R, s, cap_result(c, p), TERM_PLYCAP); return; }
+    int pi = R->elo && p->turn != s->bot_side;
+    Player *P = &R->pl[pi];
+    uint32_t forced = 0;
+    if (c->regicide) { king_ctx_set(&sc->g, p); forced = find_king_capture(&sc->g); }
+    if (forced) {                       /* exact: the side then to move has lost its King */
+        float lost = -1.0f;
+        int one = 1;
+        if (R->kids_on) kids_ply(&s->kids, &forced, NULL, &lost, P->sims ? &one : NULL, 1);
+        game_move(R, s, forced, lost, 0, PF_FORCED_KING);
+    } else if (!P->net) {
+        game_move(R, s, choose_random(c->king_safety, p, sc, &s->rng), 0.0f, 0, 0);
+    } else if (!P->sims) {
+        float v;
+        int scored, changed;
+        double t0 = sc->t_nn + sc->t_pol;
+        uint32_t mv = choose(P->net, c->king_safety, p, sc, &s->rng, temp_at(c, s->nply), &v,
+                             &scored, &changed);
+        R->t_nn += sc->t_nn + sc->t_pol - t0;
+        if (R->kids_on) kids_ply(&s->kids, sc->g.buf, sc->perm, sc->values, NULL, scored);
+        game_move(R, s, mv, v, scored, changed ? PF_KING_SAFETY : 0);
+    } else {
+        tree_begin(&s->tree[pi], P->sims, P->noise, c->noise_alpha, c->contempt, c->contempt_flat);
+        s->searching = 1;
+    }
+}
+
+static void game_searched(Run *R, Slot *s)
+{
+    const Cfg *c = R->cfg;
+    int pi = R->elo && s->pos.turn != s->bot_side, changed;
+    Tree *t = &s->tree[pi];
+    float q;
+    int e = tree_pick(t, &R->sc, &s->rng, temp_at(c, s->nply), c->king_safety, &changed, &q);
+    uint32_t mv = t->ed[t->nd[t->root].e0 + e].mv;
+    if (R->kids_on) tree_kids(t, &s->kids, &R->sc);
+    s->searching = 0;
+    game_move(R, s, mv, q, t->evals, changed ? PF_KING_SAFETY : 0);
+}
+
+static void run_status(Run *R, GpuMon *mon, int have_nvml)
+{
+    double el = now_s() - R->t_start;
+    uint64_t ev = R->evals[0] + R->evals[1], in_play = R->started - R->games_done;
+    fprintf(stderr, "  [status] %llu games done, %llu in play, %llu plies | %.0f evals/s, network "
+                    "%.0f%% of the wall clock",
+            (unsigned long long)R->games_done, (unsigned long long)in_play,
+            (unsigned long long)R->plies, el > 0 ? ev / el : 0.0, el > 0 ? 100.0 * R->t_nn / el : 0.0);
+    if (R->calls) fprintf(stderr, ", %.1f boards per call", (double)R->call_boards / R->calls);
+    if (have_nvml) {
+        double gu, gm, used, tot;
+        gpumon_take(mon, &gu, &gm, &used, &tot);
+        if (gu >= 0) fprintf(stderr, " | gpu busy %.0f%%, vram %.2f/%.2f GB", gu, used, tot);
+    }
+    fputc('\n', stderr);
+}
+
+static int mode_games(Net *net, Net *opp, const char *opp_name, Cfg *cfg, int elo,
+                      uint64_t games, int games_set, uint64_t target_positions, int first_game,
+                      const Sprt *sprt, const char *model, int device_id)
+{
+    Run *R = calloc(1, sizeof(Run));
+    R->cfg = cfg; R->elo = elo; R->games = games; R->games_set = games_set;
+    R->target_positions = target_positions; R->first_game = first_game;
+    R->opp_name = opp_name; R->sprt = sprt;
+    R->pl[0] = (Player){ net, cfg->sims, elo ? 0.0 : cfg->noise_frac, { 0 } };
+    R->pl[1] = (Player){ opp, cfg->opp_sims, 0.0, { 0 } };
+    R->mat_div = VALUE_FP >> cfg->mat_shift;
+    if (R->mat_div < 1) R->mat_div = 1;
+    pos_init(&R->base);
+    scratch_init(&R->sc);
+    gen_init(&R->wg);
+    if (elo) R->marg = malloc(sizeof(double) * ELO_N);
+    int G = cfg->games_par;
+    R->sl = calloc((size_t)G, sizeof(Slot));
+    for (int i = 0; i < G; i++) {
+        Slot *s = &R->sl[i];
+        s->rep = calloc(1, sizeof(RepTab));
+        s->ply = malloc(sizeof(PlyRecNN) * (size_t)(cfg->max_plies + 2));
+        tree_init(&s->tree[0], cfg->leaves, &s->rng);
+        tree_init(&s->tree[1], cfg->leaves, &s->rng);
+    }
+
+    R->sink = (Sink){ -1, NULL, 0, 1u << 22 };
+    if (cfg->out_path && tkn_open(&R->sink, cfg, net, model)) return 1;
+    if (cfg->children_path) {
+        if (!cfg->out_path) { fprintf(stderr, "--children needs --out: its games pair with the .tkn's\n"); return 1; }
+        if (kids_open(&R->kids, cfg->children_path, cfg->sims ? 2 : 1)) return 1;
+        R->kids_on = 1;
+    }
+    GpuMon mon;
+    memset(&mon, 0, sizeof(mon));
+    int have_nvml = cfg->stats && gpumon_start(&mon, device_id);
+
+    const char *how = cfg->sims ? "search" : "the one-ply search";
+    if (elo) {
+        fprintf(stderr, "bot (%s", how);
+        if (cfg->sims) fprintf(stderr, ", %d sims", cfg->sims);
+        fprintf(stderr, ") vs %s", opp_name);
+        if (opp) fprintf(stderr, " (%s%s)", cfg->opp_sims ? "search, " : "the one-ply search",
+                         cfg->opp_sims ? "" : "");
+        if (opp && cfg->opp_sims) fprintf(stderr, " %d sims", cfg->opp_sims);
+        fprintf(stderr, "; regicide forced, king safety %s, temperature %.3g, contempt %g\n",
+                cfg->king_safety ? "on (both sides)" : "off", cfg->temperature, cfg->contempt);
+        if (sprt->on)
+            fprintf(stderr, "SPRT: H0 elo <= %+g, H1 elo >= %+g (logistic), alpha %g beta %g; stops "
+                            "when LLR leaves [%.2f, %.2f], or after %llu games\n",
+                    sprt->elo0, sprt->elo1, sprt->alpha, sprt->beta, sprt->lower, sprt->upper,
+                    (unsigned long long)games);
+        else
+            fprintf(stderr, "fixed length: %llu games (--no-sprt)\n", (unsigned long long)games);
+        if (opp && cfg->temperature == 0.0 && cfg->opening_plies == 0)
+            fprintf(stderr,
+                "WARNING: both players are deterministic at temperature 0, so every game with a\n"
+                "         given colour is the same game. Pass --opening-plies 8\n"
+                "         --opening-temperature 1.0 or so to make the games actually differ.\n");
+    } else {
+        fprintf(stderr, "self-play with %s", how);
+        if (cfg->sims)
+            fprintf(stderr, ": %d sims a move, %d leaves per tree per call, %d games in lockstep, "
+                            "c_puct %g, root noise %g at alpha %g/moves, contempt %g%s",
+                    cfg->sims, cfg->leaves, G, cfg->cpuct, cfg->noise_frac, cfg->noise_alpha,
+                    cfg->contempt, cfg->contempt_flat ? " (flat)" : "");
+        fputc('\n', stderr);
+        if (cfg->endgames)
+            fprintf(stderr, "endgames: random starts with fewer than %d pieces, the side ahead by %d+ "
+                            "pawns holding a ranging piece; no adjudication; only royal captures kept\n",
+                    cfg->eg_max_pieces, cfg->eg_imbalance);
+        if (cfg->soft_scale > 0.0)
+            fprintf(stderr, "soft labels: a game cut off by the ply cap or by repetition is labelled "
+                            "%g * tanh(material / %g pawns)\n", cfg->soft_scale, SOFT_PAWNS);
+    }
     if (cfg->resign_pawns > 0)
         fprintf(stderr, "adjudication: a %d-pawn lead held for %d plies wins\n",
                 cfg->resign_pawns, cfg->resign_plies);
-    fprintf(stderr, "ply cap %d: scored %s\n", cfg->max_plies,
-            cfg->cap_by_material ? "for the side ahead by 50+ pawns, else a draw" : "as a draw");
-    fprintf(stderr, "the bot's value head scores its policy's top %.1f%% of the moves plus %.1f%% "
-                    "at random", 100.0 * bot_pk->top, 100.0 * bot_pk->explore);
-    if (opp && opp_pk->pol)
-        fprintf(stderr, "; so does the baseline, with its own policy\n");
-    else if (opp)
-        fprintf(stderr, "; its opponent, the same network, scores every child (--vs-full)\n");
-    else
-        fputc('\n', stderr);
-    if (sprt->on)
-        fprintf(stderr, "SPRT: H0 elo <= %+g, H1 elo >= %+g (logistic), alpha %g beta %g; stops "
-                        "when LLR leaves [%.2f, %.2f], or after %llu games\n",
-                sprt->elo0, sprt->elo1, sprt->alpha, sprt->beta, sprt->lower, sprt->upper,
-                (unsigned long long)games);
-    else
-        fprintf(stderr, "fixed length: %llu games (--no-sprt)\n", (unsigned long long)games);
-    if (opp && cfg->temperature == 0.0 && bot_pk->explore <= 0.0)
-        fprintf(stderr,
-            "WARNING: both players are deterministic at temperature 0, so every game with a\n"
-            "         given colour is the same game. The record will be N copies of two\n"
-            "         results and the interval will be far too narrow to believe. Pass\n"
-            "         --temperature 0.3 or so to make the games actually differ.\n");
 
-    for (uint64_t gi = 0; gi < games; gi++) {
-        uint64_t seed = cfg->seed_base ^ (((uint64_t)first_game + gi) * 0x9E3779B97F4A7C15ull);
-        Rng rng; rng_seed(&rng, seed);
-        memcpy(p, base, sizeof(Pos));
-        rep->epoch++;
-        rep_bump(rep, p->hash);
+    R->t_start = R->t_status = now_s();
+    for (;;) {
+        for (int i = 0; i < G; i++)
+            if (!R->sl[i].on && may_start(R)) game_start(R, &R->sl[i]);
+        if (R->stop && R->elo) break;           /* SPRT decided: games in play are not counted */
+        int active = 0;
+        for (int i = 0; i < G; i++) active += R->sl[i].on;
+        if (!active) break;
 
-        int bot_side = (gi & 1) ? SIDE_WHITE : SIDE_BLACK;   /* alternate who moves first */
-        int nply = 0, result = RES_DRAW, term = TERM_PLYCAP, lead_run = 0;
-        double t_game = now_s();
-
-        for (;;) {
-            gen_all(p, g);
-            if (g->n == 0) { result = cfg->stalemate_loses ? (1 - p->turn) : RES_DRAW; term = TERM_STALEMATE; break; }
-            if (nply >= cfg->max_plies) { result = cap_result(cfg, p); term = TERM_PLYCAP; break; }
-
-            uint32_t forced = 0;
-            if (cfg->regicide) { king_ctx_set(g, p); forced = find_king_capture(g); }
-
-            uint32_t pick;
-            float chosen = 0.0f, leaf = 0.0f;
-            int scored = 1, have_leaf = 0, n_legal = g->n;
-            uint64_t ov0 = sc.overridden;
-            /* Whoever is to move picks: the bot's net, the baseline net, or -- when there
-             * is no baseline net -- uniformly at random. Forced regicide and King safety
-             * are rules, not evaluations, and apply to both sides. */
-            Net *mover_net = (p->turn == bot_side) ? net : opp;
-            if (forced) {
-                pick = forced;
-            } else if (!mover_net) {
-                pick = choose_random(cfg->king_safety, p, &sc, &rng);
-            } else {
-                /* The rated side may score only a random subset. It really does evaluate
-                 * just those, so the throughput saving is real and not simulated. */
-                float v;
-                pick = choose(mover_net, cfg->king_safety, p->turn == bot_side ? bot_pk : opp_pk,
-                              p, &sc, &rng, temp_at(cfg, nply), &v, &scored, NULL);
-                if (p->turn == bot_side) { bot_evals += scored; bot_plies++; chosen = v; }
-                else                     { opp_evals += scored; opp_plies++; }
-                leaf = v;
-                have_leaf = mover_net == net;   /* the baseline's own value is not recorded */
-            }
-            int overridden = sc.overridden > ov0;
-
-            int mover = p->turn, rb[2] = { p->royals[0], p->royals[1] };
-            int pieces_before = p->npieces;
-            int promoted_now = do_move(p, SQ2P[UNPACK_O(pick)], UNPACK_M(pick));
-            if (cfg->out_path) {
-                if (!have_leaf) {               /* one board through the rated net */
-                    scratch_reserve(&sc, 1);
-                    encode_stm(p, sc.boards);
-                    net_eval(net, sc.boards, 1, &leaf);
-                }
-                tkn_fill(&plybuf[nply], p, pick, leaf, n_legal, mover,
-                         (p->npieces < pieces_before ? PF_CAPTURE : 0)
-                         | (promoted_now ? PF_PROMOTION : 0) | (forced ? PF_FORCED_KING : 0)
-                         | (overridden ? PF_KING_SAFETY : 0)
-                         | (mover != bot_side ? PF_OPPONENT : 0),
-                         scored, mat_div);
-            }
-            nply++;
-
-            if (cfg->progress && nply % cfg->progress == 0)
-                fprintf(stderr, "    game %-4llu ply %4d  %s to move  moves %5d  material %+8.1f  "
-                                "value %+0.4f\r",
-                        (unsigned long long)(first_game + gi), nply,
-                        p->turn == bot_side ? "bot " : "base", g->n,
-                        p->material / (double)VALUE_FP * (bot_side == SIDE_BLACK ? 1 : -1),
-                        (double)chosen);
-
-            if (p->royals[1 - mover] < rb[1 - mover])      { result = mover;     term = TERM_ROYAL; break; }
-            if (p->royals[mover] < rb[mover])              { result = 1 - mover; term = TERM_ROYAL; break; }
-            int seen = rep_bump(rep, p->hash);
-            if (cfg->rep_limit > 0 && seen >= cfg->rep_limit) { result = RES_DRAW; term = TERM_REPETITION; break; }
-            int adj = resign_check(cfg, p, &lead_run);
-            if (adj >= 0) { result = adj; term = TERM_RESIGN; break; }
+        for (int i = 0; i < G; i++) {
+            Slot *s = &R->sl[i];
+            if (!s->on) continue;
+            if (!s->searching) game_decide(R, s);
+            if (!s->on || !s->searching) continue;
+            int pi = R->elo && s->pos.turn != s->bot_side;
+            Tree *t = &s->tree[pi];
+            tree_gather(t, cfg, s->rep, &R->wg, &R->pl[pi].batch);
+            if (!t->todo && !t->np) game_searched(R, s);
         }
-
-        plies_total += (uint64_t)nply;
-        if (cfg->out_path) {
-            tkn_put_game(&sink, plybuf, nply, result, term, seed);
-            games_written++;
+        for (int k = 0; k < 2; k++) {
+            Batch *b = &R->pl[k].batch;
+            if (!b->nb) continue;
+            R->calls++;
+            R->call_boards += (uint64_t)b->nb;
+            R->t_nn += batch_run(R->pl[k].net, b);
         }
-        Rec *r = (bot_side == SIDE_BLACK) ? &as_black : &as_white;
-        const char *tag;
-        if (result == RES_DRAW)          { r->d++; tag = "draw"; }
-        else if (result == bot_side)     { r->w++; tag = "win "; }
-        else                             { r->l++; tag = "loss"; }
+        for (int i = 0; i < G; i++) {
+            Slot *s = &R->sl[i];
+            if (!s->on || !s->searching) continue;
+            int pi = R->elo && s->pos.turn != s->bot_side;
+            if (!s->tree[pi].todo && !s->tree[pi].np) game_searched(R, s);
+        }
+        if (cfg->progress && now_s() - R->t_status >= cfg->progress) {
+            run_status(R, &mon, have_nvml);
+            R->t_status = now_s();
+        }
+    }
 
-        if (cfg->progress) fprintf(stderr, "\r%*s\r", 118, "");   /* wipe the ply line */
-        elo_fit(&as_black, &as_white, marg, &fit);
-        long wins = as_black.w + as_white.w, losses = as_black.l + as_white.l,
-             draws = as_black.d + as_white.d;
+    double dt = now_s() - R->t_start;
+    uint64_t ev = R->evals[0] + R->evals[1], in_play = R->started - R->games_done;
+    if (elo) {
+        long wins = R->as_black.w + R->as_white.w, losses = R->as_black.l + R->as_white.l,
+             draws = R->as_black.d + R->as_white.d;
         double n = (double)(wins + losses + draws);
-        double score = n > 0 ? (wins + 0.5 * draws) / n : 0.0;
-        double el = now_s() - t_start;
-
-        char sp[48] = "";
-        if (sprt->on) {
-            llr = sprt_llr(wins, draws, losses, sprt->elo0, sprt->elo1);
-            verdict = sprt_decide(sprt, llr);
-            snprintf(sp, sizeof(sp), " | LLR %+.2f [%.2f, %.2f]", llr, sprt->lower, sprt->upper);
-        }
+        if (in_play)
+            fprintf(stderr, "\n%llu games still in play when the test stopped are not counted\n",
+                    (unsigned long long)in_play);
         fprintf(stderr,
-            "game %-4llu bot=%-5s %s in %4d plies (%5.1fs) | %4ldW %4ldL %4ldD  score %.3f | "
-            "elo %+6.0f [%+.0f, %+.0f]%s | first-move %+.0f%s | %.1f min elapsed\n",
-            (unsigned long long)(first_game + gi), bot_side == SIDE_BLACK ? "black" : "white",
-            tag, nply, now_s() - t_game, wins, losses, draws, score,
-            fit.elo, fit.lo, fit.hi, fit.saturated ? " (at the grid edge)" : "",
-            fit.advantage, sp, el / 60.0);
-        if (verdict) break;
-    }
-
-    long wins = as_black.w + as_white.w, losses = as_black.l + as_white.l,
-         draws = as_black.d + as_white.d;
-    double n = (double)(wins + losses + draws);
-    fprintf(stderr,
-        "\n%ld games, %llu plies (%.0f/game), %.1f min\n"
-        "  as black : %ldW %ldL %ldD\n"
-        "  as white : %ldW %ldL %ldD\n"
-        "  overall  : %ldW %ldL %ldD   score %.4f\n"
-        "  Elo %+.0f, 95%% credible interval [%+.0f, %+.0f]   (%s = 0)\n"
-        "  draw rating %.0f, first-move advantage %+.0f\n",
-        (long)n, (unsigned long long)plies_total, n > 0 ? plies_total / n : 0.0,
-        (now_s() - t_start) / 60.0,
-        as_black.w, as_black.l, as_black.d, as_white.w, as_white.l, as_white.d,
-        wins, losses, draws, n > 0 ? (wins + 0.5 * draws) / n : 0.0,
-        fit.elo, fit.lo, fit.hi, opp_name, fit.draw_elo, fit.advantage);
-    if (fit.saturated)
-        fprintf(stderr, "  the posterior is against the grid edge: the bot did not lose enough "
-                        "games to bound its rating from that side\n");
-    if (sprt->on) {
-        if (verdict > 0)
-            fprintf(stderr, "  SPRT: H1 accepted, LLR %+.2f >= %.2f -- the bot is better than the "
-                            "baseline by at least ~%+g logistic Elo (error rate %g)\n",
-                    llr, sprt->upper, sprt->elo1, sprt->alpha);
-        else if (verdict < 0)
-            fprintf(stderr, "  SPRT: H0 accepted, LLR %+.2f <= %.2f -- the bot is not %+g logistic "
-                            "Elo better than the baseline (error rate %g)\n",
-                    llr, sprt->lower, sprt->elo1, sprt->beta);
-        else
-            fprintf(stderr, "  SPRT: undecided after %ld games, LLR %+.2f inside [%.2f, %.2f]: "
-                            "the --games limit came first. The evidence does not yet separate "
-                            "%+g from %+g; read the Elo interval above, or raise --games\n",
-                    (long)n, llr, sprt->lower, sprt->upper, sprt->elo0, sprt->elo1);
-    }
-
-    if (bot_plies && opp_plies)
-        printf("  children scored per ply: rated side %.0f, opponent %.0f  (%.1f%% of the work)\n",
-               bot_evals / bot_plies, opp_evals / opp_plies,
-               100.0 * (bot_evals / bot_plies) / (opp_evals / opp_plies));
-    if (cfg->king_safety)
-        fprintf(stderr, "  king safety changed the pick on %llu plies (%.2f%%), both sides\n",
-                (unsigned long long)sc.overridden,
-                plies_total ? 100.0 * sc.overridden / plies_total : 0.0);
-    if (cfg->out_path) {
-        tkn_close(&sink, games_written, plies_total);
-        fprintf(stderr, "  wrote %llu games, %llu positions to %s\n",
-                (unsigned long long)games_written, (unsigned long long)plies_total,
-                cfg->out_path);
-    }
-    free(plybuf); free(marg); scratch_free(&sc);
-    free(rep); free(base); free(p);
-    return 0;
-}
-
-/* ---- what does evaluating only a subset of children cost? --------------------- */
-/* The policy scores every child, so a ply costs the branching factor. This measures what
- * is lost by scoring only a random fraction of them.
- *
- * Values are held in the mover's frame -- the negation the policy already applies -- so
- * the best child is the largest, and a subset's loss is best_full - best_subset >= 0.
- *
- * The subset's values are read out of the full evaluation rather than run as their own
- * batch. That is exact, not an approximation: a child's value does not depend on which
- * other children shared its batch. Only fp16 batch-shape rounding does, and --verify
- * measures that against a real subset-sized GPU run. Being exact makes every proportion
- * and every repeat free, so one self-play pass yields the whole curve.
- */
-#define MAX_PROPS 16
-
-typedef struct { double best, mean, sd, spread, p90, p95; int argbest; } VStats;
-
-static int cmp_dbl(const void *a, const void *b)
-{
-    double x = *(const double *)a, y = *(const double *)b;
-    return (x > y) - (x < y);
-}
-
-static double pctile(const double *sorted, int n, double q)
-{
-    if (n <= 0) return 0.0;
-    double pos = q * (n - 1);
-    int i = (int)pos;
-    double f = pos - i;
-    return (i + 1 < n) ? sorted[i] * (1 - f) + sorted[i + 1] * f : sorted[n - 1];
-}
-
-static double *vs_buf = NULL;
-static int vs_cap = 0;
-
-/* idx == NULL means "all k of them, in order" */
-static void vstats(const float *mv, const int *idx, int k, VStats *s)
-{
-    if (k > vs_cap) { vs_cap = k + 64; vs_buf = realloc(vs_buf, (size_t)vs_cap * sizeof(double)); }
-    double sum = 0.0, sum2 = 0.0;
-    s->best = -1e30;
-    s->argbest = idx ? idx[0] : 0;
-    for (int j = 0; j < k; j++) {
-        int i = idx ? idx[j] : j;
-        double v = mv[i];
-        vs_buf[j] = v;
-        sum += v;
-        sum2 += v * v;
-        if (v > s->best) { s->best = v; s->argbest = i; }
-    }
-    s->mean = sum / k;
-    double var = sum2 / k - s->mean * s->mean;
-    s->sd = var > 0 ? sqrt(var) : 0.0;
-    qsort(vs_buf, (size_t)k, sizeof(double), cmp_dbl);
-    s->spread = vs_buf[k - 1] - vs_buf[0];
-    s->p90 = pctile(vs_buf, k, 0.90);
-    s->p95 = pctile(vs_buf, k, 0.95);
-}
-
-/* Value the sampling policy actually expects to get from this set, at temperature T.
- * The engine samples rather than taking the argmax, so this is the decision-relevant
- * number; the argmax loss is the T -> 0 case of it. */
-static double policy_ev(const float *mv, const int *idx, int k, double T)
-{
-    if (T <= 0.0) {
-        double b = -1e30;
-        for (int j = 0; j < k; j++) { double v = mv[idx ? idx[j] : j]; if (v > b) b = v; }
-        return b;
-    }
-    double mx = -1e30;
-    for (int j = 0; j < k; j++) { double v = mv[idx ? idx[j] : j] / T; if (v > mx) mx = v; }
-    double z = 0.0, ev = 0.0;
-    for (int j = 0; j < k; j++) {
-        double v = mv[idx ? idx[j] : j], w = exp(v / T - mx);
-        z += w;
-        ev += w * v;
-    }
-    return ev / z;
-}
-
-typedef struct {
-    double  p;
-    long    n;
-    double  sum_loss, sum_loss2, max_loss, sum_pol, sum_k, sum_rank, sum_agree;
-    double  sum_mean, sum_sd, sum_spread, sum_p90, sum_p95;
-    double *loss;
-    int     lcap;
-} PropAcc;
-
-static int mode_subsample(Net *net, Cfg *cfg, uint64_t games, int first_game,
-                          const double *props, int nprops, int repeats, int stride,
-                          const char *csv_path, int verify)
-{
-    Pos *base = malloc(sizeof(Pos)), *p = malloc(sizeof(Pos)), *child = malloc(sizeof(Pos));
-    pos_init(base);
-    Gen g = { malloc(8192 * 4), 0, 8192, calloc(MAXMOVE, 2), 0, calloc(NSQ, 2), 0, -1, 0, 0 };
-    RepTab *rep = calloc(1, sizeof(RepTab));
-
-    int32_t *boards = NULL, *sub_boards = NULL;
-    float   *values = NULL, *mv = NULL, *sub_vals = NULL;
-    double  *weights = NULL;
-    int     *perm = NULL;
-    int      bcap = 0;
-
-    PropAcc acc[MAX_PROPS];
-    memset(acc, 0, sizeof(acc));
-    for (int q = 0; q < nprops; q++) acc[q].p = props[q];
-
-    FILE *csv = NULL;
-    if (csv_path) {
-        csv = fopen(csv_path, "w");
-        if (!csv) { perror(csv_path); return 1; }
-        fprintf(csv, "game,ply,n_children,proportion,repeat,k,best_full,best_part,loss,rank,"
-                     "agree,mean_full,sd_full,spread_full,p90_full,p95_full,"
-                     "mean_part,sd_part,spread_part,p90_part,p95_part,ev_full,ev_part,policy_loss\n");
-    }
-
-    long positions = 0, skipped_forced = 0;
-    double full_mean = 0, full_sd = 0, full_spread = 0, full_p90 = 0, full_p95 = 0, full_n = 0;
-    double full_best = 0, full_gap = 0;
-    double t0 = now_s(), verify_dev = -1.0;
-    long verified = 0;
-
-    fprintf(stderr, "subset evaluation: %llu games, stride %d, %d repeats per proportion, "
-                    "temperature %.3g\n",
-            (unsigned long long)games, stride, repeats, cfg->temperature);
-
-    for (uint64_t gi = 0; gi < games; gi++) {
-        uint64_t seed = cfg->seed_base ^ (((uint64_t)first_game + gi) * 0x9E3779B97F4A7C15ull);
-        Rng rng;
-        rng_seed(&rng, seed);
-        memcpy(p, base, sizeof(Pos));
-        rep->epoch++;
-        rep_bump(rep, p->hash);
-        int nply = 0;
-
-        for (;;) {
-            gen_all(p, &g);
-            if (g.n == 0 || nply >= cfg->max_plies) break;
-
-            uint32_t forced = 0;
-            if (cfg->regicide) { king_ctx_set(&g, p); forced = find_king_capture(&g); }
-
-            if (g.n > bcap) {
-                bcap = g.n + 256;
-                boards     = realloc(boards,     (size_t)bcap * NSQ * sizeof(int32_t));
-                sub_boards = realloc(sub_boards, (size_t)bcap * NSQ * sizeof(int32_t));
-                values     = realloc(values,     (size_t)bcap * sizeof(float));
-                sub_vals   = realloc(sub_vals,   (size_t)bcap * sizeof(float));
-                mv         = realloc(mv,         (size_t)bcap * sizeof(float));
-                weights    = realloc(weights,    (size_t)bcap * sizeof(double));
-                perm       = realloc(perm,       (size_t)bcap * sizeof(int));
-                if (!boards || !sub_boards || !values || !sub_vals || !mv || !weights || !perm) {
-                    fprintf(stderr, "oom in candidate buffers\n");
-                    return 1;
-                }
-            }
-            for (int i = 0; i < g.n; i++) {
-                memcpy(child, p, sizeof(Pos));
-                do_move(child, SQ2P[UNPACK_O(g.buf[i])], UNPACK_M(g.buf[i]));
-                encode_stm(child, boards + (size_t)i * NSQ);
-            }
-            net_eval(net, boards, g.n, values);
-            for (int i = 0; i < g.n; i++) mv[i] = -values[i];      /* the mover's frame */
-
-            int measure = !forced && (nply % stride == 0);
-            if (forced) skipped_forced++;
-
-            if (measure) {
-                VStats f;
-                vstats(mv, NULL, g.n, &f);
-                double ev_full = policy_ev(mv, NULL, g.n, cfg->temperature);
-                positions++;
-                full_mean += f.mean; full_sd += f.sd; full_spread += f.spread;
-                full_p90 += f.p90; full_p95 += f.p95; full_n += g.n;
-                full_best += f.best; full_gap += f.best - f.p95;
-
-                for (int q = 0; q < nprops; q++) {
-                    int k = (int)(props[q] * g.n + 0.5);
-                    if (k < 1) k = 1;
-                    if (k > g.n) k = g.n;
-                    for (int r = 0; r < repeats; r++) {
-                        for (int i = 0; i < g.n; i++) perm[i] = i;
-                        for (int i = 0; i < k; i++) {          /* partial Fisher-Yates */
-                            int j = i + (int)rng_below(&rng, (uint32_t)(g.n - i));
-                            int t = perm[i]; perm[i] = perm[j]; perm[j] = t;
-                        }
-                        VStats s;
-                        vstats(mv, perm, k, &s);
-                        double loss = f.best - s.best;
-                        double ev_part = policy_ev(mv, perm, k, cfg->temperature);
-                        int rank = 0;
-                        for (int i = 0; i < g.n; i++) if (mv[i] > s.best) rank++;
-
-                        PropAcc *a = &acc[q];
-                        if (a->n == a->lcap) {
-                            a->lcap = a->lcap ? a->lcap * 2 : 4096;
-                            a->loss = realloc(a->loss, (size_t)a->lcap * sizeof(double));
-                        }
-                        a->loss[a->n] = loss;
-                        a->n++;
-                        a->sum_loss += loss;
-                        a->sum_loss2 += loss * loss;
-                        if (loss > a->max_loss) a->max_loss = loss;
-                        a->sum_pol += ev_full - ev_part;
-                        a->sum_k += k;
-                        a->sum_rank += rank;
-                        a->sum_agree += (s.argbest == f.argbest);
-                        a->sum_mean += s.mean; a->sum_sd += s.sd; a->sum_spread += s.spread;
-                        a->sum_p90 += s.p90; a->sum_p95 += s.p95;
-
-                        if (csv)
-                            fprintf(csv, "%llu,%d,%d,%.4f,%d,%d,%.6f,%.6f,%.6f,%d,%d,"
-                                         "%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,%.6f,"
-                                         "%.6f,%.6f,%.6f\n",
-                                    (unsigned long long)(first_game + gi), nply, g.n,
-                                    props[q], r, k, f.best, s.best, loss, rank,
-                                    s.argbest == f.argbest,
-                                    f.mean, f.sd, f.spread, f.p90, f.p95,
-                                    s.mean, s.sd, s.spread, s.p90, s.p95,
-                                    ev_full, ev_part, ev_full - ev_part);
-
-                        /* Prove the subset really is a read-out of the full evaluation by
-                         * running it as its own GPU batch, for the first few positions. */
-                        if (verify > 0 && verified < verify && q == nprops - 1 && r == 0) {
-                            for (int i = 0; i < k; i++)
-                                memcpy(sub_boards + (size_t)i * NSQ,
-                                       boards + (size_t)perm[i] * NSQ, NSQ * sizeof(int32_t));
-                            net_eval(net, sub_boards, k, sub_vals);
-                            double dmax = 0.0;
-                            for (int i = 0; i < k; i++) {
-                                double d = fabs((double)(-sub_vals[i]) - (double)mv[perm[i]]);
-                                if (d > dmax) dmax = d;
-                            }
-                            if (dmax > verify_dev) verify_dev = dmax;
-                            verified++;
-                        }
-                    }
-                }
-            }
-
-            uint32_t pick = forced ? forced
-                                   : g.buf[sample_softmax(values, g.n, cfg->temperature, &rng, weights)];
-            int mover = p->turn, rb[2] = { p->royals[0], p->royals[1] };
-            do_move(p, SQ2P[UNPACK_O(pick)], UNPACK_M(pick));
-            nply++;
-            if (cfg->progress && nply % cfg->progress == 0)
-                fprintf(stderr, "    game %-3llu ply %4d  children %5d  positions measured %ld"
-                                "   %.1f min\r",
-                        (unsigned long long)(first_game + gi), nply, g.n, positions,
-                        (now_s() - t0) / 60.0);
-            if (p->royals[1 - mover] < rb[1 - mover] || p->royals[mover] < rb[mover]) break;
-            if (cfg->rep_limit > 0 && rep_bump(rep, p->hash) >= cfg->rep_limit) break;
+            "\n%ld games, %llu plies (%.0f/game), %.1f min\n"
+            "  as black : %ldW %ldL %ldD\n"
+            "  as white : %ldW %ldL %ldD\n"
+            "  overall  : %ldW %ldL %ldD   score %.4f\n"
+            "  Elo %+.0f, 95%% credible interval [%+.0f, %+.0f]   (%s = 0)\n"
+            "  draw rating %.0f, first-move advantage %+.0f\n",
+            (long)n, (unsigned long long)R->plies, n > 0 ? R->plies / n : 0.0, dt / 60.0,
+            R->as_black.w, R->as_black.l, R->as_black.d, R->as_white.w, R->as_white.l, R->as_white.d,
+            wins, losses, draws, n > 0 ? (wins + 0.5 * draws) / n : 0.0,
+            R->fit.elo, R->fit.lo, R->fit.hi, opp_name, R->fit.draw_elo, R->fit.advantage);
+        if (R->fit.saturated)
+            fprintf(stderr, "  the posterior is against the grid edge: the bot did not lose enough "
+                            "games to bound its rating from that side\n");
+        if (sprt->on) {
+            if (R->verdict > 0)
+                fprintf(stderr, "  SPRT: H1 accepted, LLR %+.2f >= %.2f -- the bot is better than the "
+                                "baseline by at least ~%+g logistic Elo (error rate %g)\n",
+                        R->llr, sprt->upper, sprt->elo1, sprt->alpha);
+            else if (R->verdict < 0)
+                fprintf(stderr, "  SPRT: H0 accepted, LLR %+.2f <= %.2f -- the bot is not %+g logistic "
+                                "Elo better than the baseline (error rate %g)\n",
+                        R->llr, sprt->lower, sprt->elo1, sprt->beta);
+            else
+                fprintf(stderr, "  SPRT: undecided after %ld games, LLR %+.2f inside [%.2f, %.2f]: "
+                                "the --games limit came first. The evidence does not yet separate "
+                                "%+g from %+g; read the Elo interval above, or raise --games\n",
+                        (long)n, R->llr, sprt->lower, sprt->upper, sprt->elo0, sprt->elo1);
         }
-        if (cfg->progress) fprintf(stderr, "\r%*s\r", 100, "");
-        fprintf(stderr, "  game %llu: %d plies, %ld positions measured so far (%.1f min)\n",
-                (unsigned long long)(first_game + gi), nply, positions, (now_s() - t0) / 60.0);
+        if (R->moves[0] && R->moves[1] && opp)
+            printf("  network evaluations per move: rated side %.1f, opponent %.1f\n",
+                   (double)R->evals[0] / R->moves[0], (double)R->evals[1] / R->moves[1]);
+    } else {
+        fprintf(stderr,
+            "games=%llu plies=%llu (%.1f/game) evals=%llu (%.1f a move)\n"
+            "  %.1fs total, %.1fs in the network (%.0f%%), %.0f evals/s",
+            (unsigned long long)R->games_done, (unsigned long long)R->plies,
+            R->games_done ? (double)R->plies / R->games_done : 0.0, (unsigned long long)ev,
+            R->plies ? (double)ev / R->plies : 0.0, dt, R->t_nn, dt > 0 ? 100.0 * R->t_nn / dt : 0.0,
+            dt > 0 ? ev / dt : 0.0);
+        if (R->calls) fprintf(stderr, ", %.1f boards per call", (double)R->call_boards / R->calls);
+        fprintf(stderr, "\n  black=%llu white=%llu draw=%llu\n",
+            (unsigned long long)R->wins[RES_BLACK], (unsigned long long)R->wins[RES_WHITE],
+            (unsigned long long)R->wins[RES_DRAW]);
+        if (cfg->endgames)
+            fprintf(stderr, "  endgames: kept %llu royal captures of %llu games (%.1f%%), %llu plies; "
+                            "%llu random positions drawn, %.1f%% accepted (%llu short of the lead, "
+                            "%llu with a King capturable at once)\n",
+                    (unsigned long long)R->kept_games, (unsigned long long)R->games_done,
+                    R->games_done ? 100.0 * R->kept_games / R->games_done : 0.0,
+                    (unsigned long long)R->kept_plies,
+                    (unsigned long long)(R->eg.made + R->eg.short_lead + R->eg.king_hangs),
+                    R->eg.made ? 100.0 * R->eg.made / (double)(R->eg.made + R->eg.short_lead + R->eg.king_hangs) : 0.0,
+                    (unsigned long long)R->eg.short_lead, (unsigned long long)R->eg.king_hangs);
+        else if (cfg->drop_capped)
+            fprintf(stderr, "  dropped %llu games that reached the ply cap (%.1f%%, %llu plies); "
+                            "wrote %llu games, %llu plies\n",
+                    (unsigned long long)(R->games_done - R->kept_games),
+                    R->games_done ? 100.0 * (R->games_done - R->kept_games) / R->games_done : 0.0,
+                    (unsigned long long)(R->plies - R->kept_plies),
+                    (unsigned long long)R->kept_games, (unsigned long long)R->kept_plies);
     }
-
-    if (!positions) { fprintf(stderr, "no positions measured\n"); return 1; }
-
-    printf("\n%ld positions from %llu games, %.0f children each on average "
-           "(%ld forced King captures skipped)\n",
-           positions, (unsigned long long)games, full_n / positions, skipped_forced);
-    printf("full evaluation, averaged over positions: best %+.4f  mean %+.4f  sd %.4f  "
-           "spread %.4f  p90 %+.4f  p95 %+.4f\n",
-           full_best / positions, full_mean / positions, full_sd / positions,
-           full_spread / positions, full_p90 / positions, full_p95 / positions);
-    printf("  the best child sits %+.4f above the 95th percentile on average. When that gap is\n"
-           "  wide the argmax loss is all-or-nothing, and top-1 agreement says more than the mean.\n",
-           full_gap / positions);
-    if (verify_dev >= 0)
-        printf("verify: a real subset-sized GPU batch reproduced the read-out values to %.2e "
-               "over %ld positions\n", verify_dev, verified);
-
-    printf("\n  frac   evals   top-1    mean     sd      p50     p90     p95     max    "
-           "policy   rank   sd of\n");
-    printf(  "         /pos    agree    loss    loss     loss    loss    loss    loss    "
-           "loss    of pick subset\n");
-    for (int q = 0; q < nprops; q++) {
-        PropAcc *a = &acc[q];
-        if (!a->n) continue;
-        qsort(a->loss, (size_t)a->n, sizeof(double), cmp_dbl);
-        double m = a->sum_loss / a->n;
-        double var = a->sum_loss2 / a->n - m * m;
-        printf("  %5.3f  %6.0f  %5.1f%%  %7.4f %7.4f  %7.4f %7.4f %7.4f %7.4f  %7.4f  %6.1f  %6.4f\n",
-               a->p, a->sum_k / a->n, 100.0 * a->sum_agree / a->n, m,
-               var > 0 ? sqrt(var) : 0.0,
-               pctile(a->loss, (int)a->n, 0.50), pctile(a->loss, (int)a->n, 0.90),
-               pctile(a->loss, (int)a->n, 0.95), a->max_loss,
-               a->sum_pol / a->n, a->sum_rank / a->n, a->sum_sd / a->n);
+    if (cfg->king_safety)
+        fprintf(stderr, "  king safety changed the pick on %llu plies (%.2f%%); %llu plies had no "
+                        "safe move at all\n",
+                (unsigned long long)R->sc.overridden,
+                R->plies ? 100.0 * R->sc.overridden / R->plies : 0.0,
+                (unsigned long long)R->sc.hopeless);
+    if (have_nvml) run_status(R, &mon, have_nvml);
+    gpumon_stop(&mon);
+    if (cfg->out_path) {
+        tkn_close(&R->sink, elo ? R->games_done : R->kept_games, elo ? R->plies : R->kept_plies);
+        if (elo)
+            fprintf(stderr, "  wrote %llu games, %llu positions to %s\n",
+                    (unsigned long long)R->games_done, (unsigned long long)R->plies, cfg->out_path);
     }
-    printf("\ntop-1 agreement should track frac: the chance a uniform subset holds the best child\n"
-           "is k/n, which is the fraction. Departures from that line are the interesting part.\n");
-    printf("loss = best value over all children minus best over the sampled subset, in the\n"
-           "mover's frame, so it is >= 0 and in the same units as the value head (tanh, [-1,1]).\n"
-           "policy loss compares the expected value of sampling at temperature %.3g from the\n"
-           "subset against sampling from the whole set -- the argmax loss is its T -> 0 case.\n"
-           "rank of pick is how many children were genuinely better than the one the subset chose.\n",
-           cfg->temperature);
-    if (csv) { fclose(csv); printf("per-position rows written to %s\n", csv_path); }
-
-    for (int q = 0; q < nprops; q++) free(acc[q].loss);
-    free(boards); free(sub_boards); free(values); free(sub_vals); free(mv); free(weights);
-    free(perm); free(vs_buf); vs_buf = NULL; vs_cap = 0;
-    free(g.buf); free(g.stamp); free(g.kline); free(rep); free(base); free(p); free(child);
-    return 0;
+    if (R->kids_on) kids_close(&R->kids);
+    for (int i = 0; i < G; i++) {
+        Slot *s = &R->sl[i];
+        free(s->rep); free(s->ply); free(s->kids.b);
+        tree_free(&s->tree[0]); tree_free(&s->tree[1]);
+    }
+    for (int k = 0; k < 2; k++) {
+        Batch *b = &R->pl[k].batch;
+        free(b->boards); free(b->rows); free(b->val); free(b->lgt); free(b->tr); free(b->leaf); free(b->roff);
+    }
+    free(R->sl); free(R->marg);
+    free(R->wg.buf); free(R->wg.stamp); free(R->wg.kline);
+    scratch_free(&R->sc);
+    int rc = R->eg_failed;
+    free(R);
+    return rc;
 }
 
 /* ---- how much of the outcome does the position actually decide? ---------------------- */
@@ -2307,7 +2900,7 @@ static int mode_subsample(Net *net, Cfg *cfg, uint64_t games, int first_game,
 /* One move for the side to move: a forced King capture if there is one, otherwise
  * choose(). Leaves the move list in s->g, so the caller can see a stalemate as
  * s->g.n == 0. */
-static uint32_t pick_move(Net *net, const Cfg *cfg, const Pick *pk, Pos *p,
+static uint32_t pick_move(Net *net, const Cfg *cfg, Pos *p,
                           Scratch *s, Rng *rng, int ply, float *val)
 {
     gen_all(p, &s->g);
@@ -2317,17 +2910,17 @@ static uint32_t pick_move(Net *net, const Cfg *cfg, const Pick *pk, Pos *p,
         uint32_t forced = find_king_capture(&s->g);
         if (forced) { if (val) *val = 0.0f; return forced; }
     }
-    return choose(net, cfg->king_safety, pk, p, s, rng, temp_at(cfg, ply), val,
+    return choose(net, cfg->king_safety, p, s, rng, temp_at(cfg, ply), val,
                   NULL, NULL);
 }
 
 /* Plays from `ply` to a finish, under the same rules as self-play, including the lead
  * count `run` the main line had reached. Returns RES_BLACK, RES_WHITE or RES_DRAW. */
-static int playout(Net *net, const Cfg *cfg, const Pick *pk, Pos *p, RepTab *rep,
+static int playout(Net *net, const Cfg *cfg, Pos *p, RepTab *rep,
                    Scratch *s, Rng *rng, int ply, int run)
 {
     for (;;) {
-        uint32_t pick = pick_move(net, cfg, pk, p, s, rng, ply, NULL);
+        uint32_t pick = pick_move(net, cfg, p, s, rng, ply, NULL);
         if (s->g.n == 0) return cfg->stalemate_loses ? (1 - p->turn) : RES_DRAW;
         if (ply >= cfg->max_plies) return cap_result(cfg, p);
         int mover = p->turn, rb[2] = { p->royals[0], p->royals[1] };
@@ -2343,7 +2936,7 @@ static int playout(Net *net, const Cfg *cfg, const Pick *pk, Pos *p, RepTab *rep
 
 typedef struct { double zbar, s2, v0; int ply, k; } Branch;
 
-static int mode_variance(Net *net, Cfg *cfg, const Pick *pk, uint64_t games,
+static int mode_variance(Net *net, Cfg *cfg, uint64_t games,
                          int first_game, int branch_every, int branches, int max_points,
                          const char *csv_path)
 {
@@ -2374,7 +2967,7 @@ static int mode_variance(Net *net, Cfg *cfg, const Pick *pk, uint64_t games,
     fprintf(stderr, "  schedule: %g for %d plies then %g; policy top %.1f%%; max plies %d; "
                     "king safety %s\n",
             cfg->opening_temperature, cfg->opening_plies, cfg->temperature,
-            100.0 * pk->top, cfg->max_plies, cfg->king_safety ? "on" : "off");
+            100.0 * POLICY_TOP, cfg->max_plies, cfg->king_safety ? "on" : "off");
 
     for (uint64_t gi = 0; gi < games; gi++) {
         uint64_t seed = cfg->seed_base ^ (((uint64_t)first_game + gi) * 0x9E3779B97F4A7C15ull);
@@ -2388,7 +2981,7 @@ static int mode_variance(Net *net, Cfg *cfg, const Pick *pk, uint64_t games,
 
         for (;;) {
             float mv_val;
-            uint32_t pick = pick_move(net, cfg, pk, p, &sc, &rng, ply, &mv_val);
+            uint32_t pick = pick_move(net, cfg, p, &sc, &rng, ply, &mv_val);
             if (sc.g.n == 0 || ply >= cfg->max_plies) break;
 
             if (branch_every > 0 && (ply + phase) % branch_every == 0
@@ -2407,7 +3000,7 @@ static int mode_variance(Net *net, Cfg *cfg, const Pick *pk, uint64_t games,
                     Rng brng;
                     rng_seed(&brng, seed ^ ((uint64_t)(ply + 1) * 0x9E3779B97F4A7C15ull)
                                          ^ ((uint64_t)(k + 1) * 0xBF58476D1CE4E5B9ull));
-                    int r = playout(net, cfg, pk, run, rrun, &sc, &brng, ply, lead_run);
+                    int r = playout(net, cfg, run, rrun, &sc, &brng, ply, lead_run);
                     double z = (r == RES_DRAW) ? 0.0 : (r == side ? 1.0 : -1.0);
                     sum += z; sum2 += z * z;
                     playouts++;
@@ -2515,6 +3108,13 @@ static int mode_variance(Net *net, Cfg *cfg, const Pick *pk, uint64_t games,
     return 0;
 }
 
+/* Options that no longer run, kept so an old command line says why instead of "unknown". */
+static int deprecated(const char *what, const char *why)
+{
+    fprintf(stderr, "%s: this option is deprecated and no longer runs. %s\n", what, why);
+    return 1;
+}
+
 int main(int argc, char **argv)
 {
     tables_init();
@@ -2533,28 +3133,34 @@ int main(int argc, char **argv)
         free(marg);
         return 0;
     }
+    if (!strcmp(mode, "subsample"))
+        return deprecated("nnplay subsample", "It measured what scoring a random subset of the "
+                          "children costs, from before the policy chose them; the search "
+                          "replaces both.");
     if (strcmp(mode, "play") && strcmp(mode, "eval") && strcmp(mode, "elo")
-        && strcmp(mode, "selfcheck") && strcmp(mode, "subsample") && strcmp(mode, "variance")) {
+        && strcmp(mode, "selfcheck") && strcmp(mode, "variance")) {
         fputs(USAGE, stderr);
         return 1;
     }
 
-    Cfg cfg = { 3000, 4, 0, 1, 3, 1, 25, 0, 1.0, 0x5EED5EED5EED5EEDull, NULL, NULL, 1, 0, 1.0,
-                1, 300, 10, 1, 0.05, 0.02 };
+    Cfg cfg = { .max_plies = 3000, .rep_limit = 4, .stalemate_loses = 1, .mat_shift = 3,
+                .regicide = 1, .progress = 30, .temperature = 1.0, .seed_base = 0x5EED5EED5EED5EEDull,
+                .verbose = 1, .opening_temperature = 1.0, .king_safety = 1, .resign_pawns = 300,
+                .resign_plies = 10, .cap_by_material = 1, .eg_max_pieces = 20, .eg_imbalance = 50,
+                .sims = 128, .leaves = 8, .games_par = 32, .cpuct = 1.25, .noise_frac = 0.25,
+                .noise_alpha = 10.0, .contempt = 0.1, .soft_scale = 0.75, .opp_sims = -1 };
     const char *model = "net_fp16.onnx";
     uint64_t games = 1;
     int device_id = 0, sub_batch = 0, probe_cap = 8192, first_game = 0, tf32 = 1;
-    int temperature_set = 0, allow_cpu = 0, games_set = 0, seed_set = 0;
+    int temperature_set = 0, allow_cpu = 0, games_set = 0, seed_set = 0, soft_set = 0;
     Sprt sprt = { 1, 0.0, 50.0, 0.05, 0.05, 0.0, 0.0 };
     uint64_t target_positions = 0;
     const char *manifest = "net_manifest.json";
     const char *csv_path = NULL;
-    double props[MAX_PROPS] = { 0.01, 0.02, 0.05, 0.10, 0.25, 0.50 };
-    int nprops = 6, repeats = 8, stride = 1, verify = 4;
-    const char *policy_model = NULL;
-    int vs_full = 0;
     int branch_every = 100, branches = 8, max_points = 0;
     const char *baseline = NULL;         /* NULL -> derive from --precision at use */
+    static const char *PRUNE = "The one-ply search now always scores the policy's top 5% plus "
+                               "2% at random; use --sims for the search.";
 
     for (int i = 2; i < argc; i++) {
         if      (!strcmp(argv[i], "--model")       && i + 1 < argc) model = argv[++i];
@@ -2583,34 +3189,22 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--opening-plies")       && i + 1 < argc) cfg.opening_plies = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--opening-temperature") && i + 1 < argc) cfg.opening_temperature = atof(argv[++i]);
         else if (!strcmp(argv[i], "--allow-cpu"))    allow_cpu = 1;
-        else if (!strcmp(argv[i], "--subset-fraction")) {
-            fprintf(stderr, "--subset-fraction is gone: the value head now scores the policy's top "
-                            "--policy-top of the moves (default 0.05) plus --policy-explore at random "
-                            "(default 0.02). In elo, --vs-full measures what that costs against "
-                            "scoring every child.\n");
-            return 1; }
-        else if (!strcmp(argv[i], "--policy-top")     && i + 1 < argc) cfg.policy_top = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--policy-explore") && i + 1 < argc) cfg.policy_explore = atof(argv[++i]);
-        else if (!strcmp(argv[i], "--policy-model")   && i + 1 < argc) policy_model = argv[++i];
-        else if (!strcmp(argv[i], "--vs-full"))      vs_full = 1;
+        else if (!strcmp(argv[i], "--sims")          && i + 1 < argc) cfg.sims = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--baseline-sims") && i + 1 < argc) cfg.opp_sims = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--leaves")        && i + 1 < argc) cfg.leaves = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--parallel-games") && i + 1 < argc) cfg.games_par = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--cpuct")         && i + 1 < argc) cfg.cpuct = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--noise-frac")    && i + 1 < argc) cfg.noise_frac = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--noise-alpha")   && i + 1 < argc) cfg.noise_alpha = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--contempt")      && i + 1 < argc) cfg.contempt = atof(argv[++i]);
+        else if (!strcmp(argv[i], "--selfplay-soft-target-scale") && i + 1 < argc) {
+            cfg.soft_scale = atof(argv[++i]);
+            soft_set = 1;
+        }
         else if (!strcmp(argv[i], "--branch-every")  && i + 1 < argc) branch_every = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--branches")      && i + 1 < argc) branches = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--max-points")    && i + 1 < argc) max_points = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--repeats")      && i + 1 < argc) repeats = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--stride")       && i + 1 < argc) stride = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--csv")          && i + 1 < argc) csv_path = argv[++i];
-        else if (!strcmp(argv[i], "--verify")       && i + 1 < argc) verify = atoi(argv[++i]);
-        else if (!strcmp(argv[i], "--proportions")  && i + 1 < argc) {
-            const char *v = argv[++i];
-            nprops = 0;
-            while (*v && nprops < MAX_PROPS) {
-                char *end;
-                double x = strtod(v, &end);
-                if (end == v) break;
-                if (x > 0.0 && x <= 1.0) props[nprops++] = x;
-                v = (*end == ',') ? end + 1 : end;
-            }
-            if (!nprops) { fprintf(stderr, "--proportions needs values in (0, 1]\n"); return 1; } }
         else if (!strcmp(argv[i], "--manifest")     && i + 1 < argc) manifest = argv[++i];
         else if (!strcmp(argv[i], "--no-tf32"))     tf32 = 0;
         else if (!strcmp(argv[i], "--no-regicide")) cfg.regicide = 0;
@@ -2618,6 +3212,10 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--resign-lead")  && i + 1 < argc) cfg.resign_pawns = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--resign-plies") && i + 1 < argc) cfg.resign_plies = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--cap-draw"))     cfg.cap_by_material = 0;
+        else if (!strcmp(argv[i], "--drop-capped"))  cfg.drop_capped = 1;
+        else if (!strcmp(argv[i], "--endgames"))     cfg.endgames = 1;
+        else if (!strcmp(argv[i], "--endgames-max-pieces") && i + 1 < argc) cfg.eg_max_pieces = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--endgames-imbalance")  && i + 1 < argc) cfg.eg_imbalance = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-sprt"))     sprt.on = 0;
         else if (!strcmp(argv[i], "--sprt")         && i + 1 < argc) {
             if (sscanf(argv[++i], "%lf,%lf", &sprt.elo0, &sprt.elo1) != 2 || sprt.elo1 <= sprt.elo0) {
@@ -2628,8 +3226,29 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--alpha")        && i + 1 < argc) sprt.alpha = atof(argv[++i]);
         else if (!strcmp(argv[i], "--beta")         && i + 1 < argc) sprt.beta = atof(argv[++i]);
         else if (!strcmp(argv[i], "--quiet"))     { cfg.verbose = 0; cfg.progress = 0; }
+        else if (!strcmp(argv[i], "--subset-fraction") || !strcmp(argv[i], "--policy-top")
+                 || !strcmp(argv[i], "--policy-explore"))
+            return deprecated(argv[i], PRUNE);
+        else if (!strcmp(argv[i], "--policy-model"))
+            return deprecated(argv[i], "The policy is part of the model graph now; re-export with "
+                                       "export_onnx.py.");
+        else if (!strcmp(argv[i], "--vs-full"))
+            return deprecated(argv[i], "It measured the one-ply pruning against scoring every "
+                                       "child; compare --sims settings with --baseline-sims.");
+        else if (!strcmp(argv[i], "--proportions") || !strcmp(argv[i], "--repeats")
+                 || !strcmp(argv[i], "--stride") || !strcmp(argv[i], "--verify"))
+            return deprecated(argv[i], "It belonged to the subsample mode, which is gone.");
         else { fprintf(stderr, "unknown option %s\n", argv[i]); fputs(USAGE, stderr); return 1; }
     }
+    if (cfg.sims < 0 || cfg.leaves < 1 || cfg.games_par < 1 || cfg.cpuct <= 0.0
+        || cfg.noise_frac < 0.0 || cfg.noise_frac > 1.0 || cfg.noise_alpha <= 0.0) {
+        fprintf(stderr, "--sims >= 0, --leaves >= 1, --parallel-games >= 1, --cpuct > 0, "
+                        "--noise-frac in [0, 1] and --noise-alpha > 0, please\n");
+        return 1;
+    }
+    if (!strcmp(mode, "elo")) { if (cfg.opp_sims < 0) cfg.opp_sims = cfg.sims; }
+    else cfg.opp_sims = 0;
+    if (!strcmp(mode, "variance")) cfg.sims = 0;
 
     /* A fixed default seed made every session replay the previous one's games: game i's
      * seed is a function of the base seed and i alone, so two sessions with the same model
@@ -2642,84 +3261,57 @@ int main(int argc, char **argv)
                 ^ (uint64_t)(now_s() * 1e9);
         cfg.seed_base = r;
     }
+    if ((cfg.drop_capped || cfg.endgames || cfg.children_path) && strcmp(mode, "play")) {
+        fprintf(stderr, "--drop-capped, --endgames and --children apply to play only\n");
+        return 1;
+    }
+    if (soft_set && strcmp(mode, "play")) {
+        fprintf(stderr, "--selfplay-soft-target-scale applies to play only\n");
+        return 1;
+    }
+    if (!(cfg.soft_scale >= 0.0 && cfg.soft_scale <= 1.0)) {
+        fprintf(stderr, "--selfplay-soft-target-scale must be in [0, 1]\n");
+        return 1;
+    }
+    if (strcmp(mode, "play") || cfg.endgames) cfg.soft_scale = 0.0;   /* endgames keep only kings */
+    cfg.contempt_flat = !strcmp(mode, "play");
+    if (cfg.endgames) {
+        if (cfg.eg_max_pieces < 4 || cfg.eg_max_pieces > 805 || cfg.eg_imbalance < 0) {
+            fprintf(stderr, "--endgames-max-pieces must be 4..805 (two Kings and a ranging piece "
+                            "need 3, and it is a strict bound) and --endgames-imbalance >= 0\n");
+            return 1;
+        }
+        cfg.resign_pawns = 0;          /* a lead is the starting condition, not a result */
+        cfg.cap_by_material = 0;
+        eg_tables();
+    }
     if (strcmp(mode, "eval") && strcmp(mode, "selfcheck"))     /* the modes that play games */
         fprintf(stderr, "seed %llu%s\n", (unsigned long long)cfg.seed_base,
                 seed_set ? "" : " (random; --seed with this value repeats the run)");
 
     Net net;
     net_open(&net, model, device_id, sub_batch, probe_cap, tf32, allow_cpu, cfg.verbose);
-    if (cfg.policy_top <= 0.0 || cfg.policy_top > 1.0 || cfg.policy_explore < 0.0 || cfg.policy_explore > 0.255) {
-        fprintf(stderr, "--policy-top must be in (0, 1] and --policy-explore in [0, 0.255]\n");
-        return 1;
-    }
-    /* The policy graph beside the value graph. play, elo and variance choose moves with
-     * it and refuse without it; eval, selfcheck and subsample measure the value graph and
-     * use it only if present. */
-    char ppath[512];
-    policy_path(model, ppath, sizeof(ppath));
-    if (policy_model) snprintf(ppath, sizeof(ppath), "%s", policy_model);
-    Pol pol;
-    int have_pol = pol_open(&pol, &net, ppath, cfg.verbose) == 0;
-    int needs_pol = !strcmp(mode, "play") || !strcmp(mode, "elo") || !strcmp(mode, "variance");
-    if (needs_pol && !have_pol) {
-        fprintf(stderr,
-            "%s: no policy graph '%s'.\n"
-            "     play, elo and variance pick the children to score with the policy head, so they\n"
-            "     need a model_policy.py checkpoint exported with export_onnx.py, which writes it\n"
-            "     beside the value graph. A legacy model has no policy head and cannot be used.\n",
-            mode, ppath);
-        net_close(&net);
-        return 1;
-    }
-    Pick pick_cfg = { have_pol ? &pol : NULL, cfg.policy_top, cfg.policy_explore };
-    if (!strcmp(mode, "eval")) { int rc = mode_eval(&net); net_close(&net); return rc; }
-    if (!strcmp(mode, "selfcheck")) {
-        int rc = mode_selfcheck(&net, have_pol ? &pol : NULL, manifest);
-        if (have_pol) pol_close(&pol);
-        net_close(&net);
-        return rc;
-    }
-    if (!strcmp(mode, "variance")) {
-        int rc = mode_variance(&net, &cfg, &pick_cfg, games, first_game,
-                               branch_every, branches, max_points, csv_path);
-        pol_close(&pol);
-        net_close(&net);
-        return rc;
-    }
-    if (!strcmp(mode, "subsample")) {
-        int rc = mode_subsample(&net, &cfg, games, first_game, props, nprops,
-                                repeats, stride, csv_path, verify);
-        net_close(&net);
-        return rc;
-    }
-    if (!strcmp(mode, "elo")) {
+    int rc;
+    if (!strcmp(mode, "eval")) rc = mode_eval(&net);
+    else if (!strcmp(mode, "selfcheck")) rc = mode_selfcheck(&net, manifest);
+    else if (!strcmp(mode, "variance"))
+        rc = mode_variance(&net, &cfg, games, first_game, branch_every, branches, max_points, csv_path);
+    else if (!strcmp(mode, "play"))
+        rc = mode_games(&net, NULL, NULL, &cfg, 0, games, games_set, target_positions, first_game,
+                        &sprt, model, device_id);
+    else {
         /* Greedy measures strength, but a kept match is training data, and greedy games
          * are the least varied there are; --out samples unless told otherwise. */
         if (!temperature_set) cfg.temperature = cfg.out_path ? 0.3 : 0.0;
-
         /* The baseline defaults to the graph exported from baseline.pt, matching the
          * precision the bot is running. "random" asks for the uniform mover instead, which
          * is the absolute anchor but stops discriminating once the bot beats it every
          * game. */
         char bpath[512];
         Net opp;
-        Net *oppp = NULL;
-        Pol opol;
-        int opp_opened = 0, opol_opened = 0;
-        const char *opp_name = "uniform-random";
-        Pick opp_pick = { NULL, 1.0, 0.0 };       /* every child: the --vs-full opponent */
-
-        if (vs_full) {
-            /* The net against itself, one session driving both sides: the rated side
-             * scores the policy's picks, the opponent scores everything. No baseline graph
-             * is involved, so this isolates what the pruning costs from any change in
-             * weights. */
-            if (baseline) { fprintf(stderr, "elo: --vs-full plays the net against itself; drop --baseline\n"); return 1; }
-            oppp = &net;
-            opp_name = "itself scoring every child";
-        } else if (1) {
+        int opened = 0;
         if (!baseline) {
-            snprintf(bpath, sizeof(bpath), "baseline_%s.onnx", net.fp16_out ? "fp16" : "fp32");
+            snprintf(bpath, sizeof(bpath), "baseline_%s.onnx", net.fp16[0] ? "fp16" : "fp32");
             baseline = bpath;
         }
         if (strcmp(baseline, "random") != 0) {
@@ -2739,23 +3331,7 @@ int main(int argc, char **argv)
             /* same sub-batch as the bot: the probe has already measured this GPU, and a
              * second session doubles the memory the graphs hold */
             net_open(&opp, baseline, device_id, net.sub_batch, probe_cap, tf32, allow_cpu, cfg.verbose);
-            oppp = &opp;
-            opp_opened = 1;
-            opp_name = baseline;
-            char bp[512];
-            policy_path(baseline, bp, sizeof(bp));
-            if (pol_open(&opol, &opp, bp, cfg.verbose) != 0) {
-                fprintf(stderr, "elo: the baseline has no policy graph '%s'. A legacy model cannot be "
-                                "a baseline; export a model_policy.py checkpoint as baseline.pt, or "
-                                "use --baseline random or --vs-full.\n", bp);
-                net_close(&opp);
-                pol_close(&pol);
-                net_close(&net);
-                return 1;
-            }
-            opol_opened = 1;
-            opp_pick = (Pick){ &opol, cfg.policy_top, cfg.policy_explore };
-        }
+            opened = 1;
         }
         if (sprt.alpha <= 0.0 || sprt.alpha >= 0.5 || sprt.beta <= 0.0 || sprt.beta >= 0.5) {
             fprintf(stderr, "--alpha and --beta must be in (0, 0.5)\n");
@@ -2766,246 +3342,10 @@ int main(int argc, char **argv)
          * bounds, a bot sitting exactly on either hypothesis decides by then in ~99% of
          * matches (~250 games on average); at 400 it is ~85%. */
         if (sprt.on && !games_set) games = 1000;
-        int rc = mode_elo(&net, oppp, opp_name, &cfg, games, first_game, &pick_cfg, &opp_pick, &sprt,
-                          model);
-        if (opol_opened) pol_close(&opol);
-        if (opp_opened) net_close(oppp);
-        pol_close(&pol);
-        net_close(&net);
-        return rc;
+        rc = mode_games(&net, opened ? &opp : NULL, opened ? baseline : "uniform-random", &cfg, 1,
+                        games, games_set, 0, first_game, &sprt, model, device_id);
+        if (opened) net_close(&opp);
     }
-
-    Pos *base = malloc(sizeof(Pos)), *p = malloc(sizeof(Pos));
-    pos_init(base);
-    Scratch sc;
-    scratch_init(&sc);
-    Gen *g = &sc.g;
-    RepTab *rep = calloc(1, sizeof(RepTab));
-    PlyRecNN *plybuf = malloc(sizeof(PlyRecNN) * (size_t)(cfg.max_plies + 2));
-
-    Sink sink = { -1, NULL, 0, 1u << 22 };
-    if (cfg.out_path && tkn_open(&sink, &cfg, &net, model)) return 1;
-    Kids kids;
-    if (cfg.children_path) {
-        if (!cfg.out_path) { fprintf(stderr, "--children needs --out: its games pair with the .tkn's\n"); return 1; }
-        if (kids_open(&kids, cfg.children_path)) return 1;
-    }
-
-    int mat_div = VALUE_FP >> cfg.mat_shift;
-    if (mat_div < 1) mat_div = 1;
-
-    GpuMon mon;
-    memset(&mon, 0, sizeof(mon));      /* gpumon_stop runs unconditionally at exit */
-    int have_nvml = cfg.stats && gpumon_start(&mon, device_id);
-    if (cfg.stats && !have_nvml)
-        fprintf(stderr, "  (libnvidia-ml.so.1 not available: no GPU utilisation numbers)\n");
-
-    uint64_t total_plies = 0, total_evals = 0, games_done = 0, wins[3] = { 0 };
-    double t_start = now_s(), t_nn = 0.0, t_gen = 0.0, t_enc = 0.0, t_safe = 0.0, t_pol = 0.0;
-    double w_nn = 0.0, w_gen = 0.0, w_enc = 0.0, w_t0 = now_s();   /* since the last line */
-    uint64_t w_evals = 0;
-
-    for (uint64_t gi = 0; ; gi++) {
-        /* --positions plays whole games until the target is met, so it overshoots rather
-         * than truncating the last one: a cut-short game would be written with a result it
-         * never reached, and the value target would be a lie. */
-        if (target_positions) {
-            if (total_plies >= target_positions) break;
-            if (games_set && gi >= games) break;
-        } else if (gi >= games) {
-            break;
-        }
-        uint64_t seed = cfg.seed_base ^ (((uint64_t)first_game + gi) * 0x9E3779B97F4A7C15ull);
-        Rng rng; rng_seed(&rng, seed);
-        memcpy(p, base, sizeof(Pos));
-        rep->epoch++;
-        rep_bump(rep, p->hash);
-
-        int nply = 0, no_prog = 0, result = RES_DRAW, term = TERM_PLYCAP, lead_run = 0, adj;
-        double t_game = now_s();
-
-        for (;;) {
-            double tg = now_s();
-            gen_all(p, g);
-            t_gen += now_s() - tg; w_gen += now_s() - tg;
-            if (g->n == 0) { result = cfg.stalemate_loses ? (1 - p->turn) : RES_DRAW; term = TERM_STALEMATE; break; }
-            if (nply >= cfg.max_plies) { result = cap_result(&cfg, p); term = TERM_PLYCAP; break; }
-
-            /* Forced King capture, exactly tky.c's rule. The chosen leaf is still put
-             * through the network, one board, so every ply carries a real value. */
-            uint32_t forced = 0;
-            if (cfg.regicide) { king_ctx_set(g, p); forced = find_king_capture(g); }
-
-            /* --subset-fraction scores only a random slice of the children and picks from
-             * that slice, so the saving is real. Both sides subset: self-play has no rated
-             * side. King safety sits on top: see choose(). */
-            double enc0 = sc.t_enc, nn0 = sc.t_nn, safe0 = sc.t_safe, pol0 = sc.t_pol;
-            uint32_t pick;
-            float chosen;
-            int ncand, overridden = 0;
-            if (forced) {
-                scratch_reserve(&sc, 1);
-                double te = now_s();
-                memcpy(sc.child, p, sizeof(Pos));
-                do_move(sc.child, SQ2P[UNPACK_O(forced)], UNPACK_M(forced));
-                encode_stm(sc.child, sc.boards);
-                double t0 = now_s();
-                net_eval(&net, sc.boards, 1, sc.values);
-                sc.t_enc += t0 - te;
-                sc.t_nn += now_s() - t0;
-                pick = forced;
-                chosen = sc.values[0];
-                ncand = 1;
-            } else {
-                pick = choose(&net, cfg.king_safety, &pick_cfg, p, &sc, &rng,
-                              temp_at(&cfg, nply), &chosen, &ncand, &overridden);
-            }
-            if (cfg.children_path) {
-                if (forced) kids_ply(&kids, &pick, NULL, &chosen, 1);
-                else        kids_ply(&kids, sc.g.buf, sc.perm, sc.values, ncand);
-            }
-            t_enc += sc.t_enc - enc0; w_enc += sc.t_enc - enc0;
-            t_nn += sc.t_nn - nn0;    w_nn += sc.t_nn - nn0;
-            t_safe += sc.t_safe - safe0;
-            t_pol += sc.t_pol - pol0;
-            total_evals += (uint64_t)ncand;
-            w_evals += (uint64_t)ncand;
-
-            if (cfg.progress && nply % cfg.progress == 0) {
-                fprintf(stderr, "    ply %4d  moves %5d  value %+0.4f  material %+8.1f  "
-                                "pieces %3d  %.1f boards/s\n",
-                        nply, g->n, (double)chosen, p->material / (double)VALUE_FP,
-                        p->npieces, total_evals / (t_nn > 0 ? t_nn : 1.0));
-                if (cfg.stats) {
-                    double wall = now_s() - w_t0, other = wall - w_nn - w_gen - w_enc;
-                    fprintf(stderr, "              wall %6.2fs = nn %5.2f%% + movegen %5.2f%% "
-                                    "+ encode %5.2f%% + other %5.2f%%   %.0f boards/s in nn",
-                            wall, 100 * w_nn / wall, 100 * w_gen / wall,
-                            100 * w_enc / wall, 100 * other / wall,
-                            w_nn > 0 ? w_evals / w_nn : 0.0);
-                    if (have_nvml) {
-                        double gu, gm, used, tot;
-                        gpumon_take(&mon, &gu, &gm, &used, &tot);
-                        if (gu >= 0)
-                            fprintf(stderr, "\n              gpu busy %5.1f%%  memory bus %5.1f%%  "
-                                            "vram %.2f/%.2f GB", gu, gm, used, tot);
-                    }
-                    fputc('\n', stderr);
-                    w_nn = w_gen = w_enc = 0.0; w_evals = 0; w_t0 = now_s();
-                }
-            }
-
-            int origin36 = UNPACK_O(pick), mv = UNPACK_M(pick);
-            int mover = p->turn;
-            int royals_before[2] = { p->royals[0], p->royals[1] };
-            int pieces_before = p->npieces;
-
-            int promoted_now = do_move(p, SQ2P[origin36], mv);
-            int captured = pieces_before - p->npieces;
-
-            tkn_fill(&plybuf[nply], p, pick, chosen, g->n, mover,
-                     (captured > 0 ? PF_CAPTURE : 0) | (promoted_now ? PF_PROMOTION : 0)
-                     | (forced ? PF_FORCED_KING : 0) | (overridden ? PF_KING_SAFETY : 0),
-                     ncand, mat_div);
-            nply++;
-            no_prog = (captured > 0 || promoted_now) ? 0 : no_prog + 1;
-
-            if (p->royals[1 - mover] < royals_before[1 - mover])      { result = mover;     term = TERM_ROYAL; }
-            else if (p->royals[mover] < royals_before[mover])         { result = 1 - mover; term = TERM_ROYAL; }
-            else {
-                int seen = rep_bump(rep, p->hash);
-                if (cfg.rep_limit > 0 && seen >= cfg.rep_limit)                       { result = RES_DRAW; term = TERM_REPETITION; }
-                else if (cfg.no_progress_limit > 0 && no_prog >= cfg.no_progress_limit) { result = RES_DRAW; term = TERM_NOPROGRESS; }
-                else if ((adj = resign_check(&cfg, p, &lead_run)) >= 0)                   { result = adj;      term = TERM_RESIGN; }
-                else continue;
-            }
-            break;
-        }
-        total_plies += (uint64_t)nply;
-        games_done++;
-        wins[result]++;
-
-        if (cfg.children_path) kids_game(&kids, plybuf, nply, seed);
-        if (cfg.out_path) tkn_put_game(&sink, plybuf, nply, result, term, seed);
-        if (cfg.verbose) {
-            static const char *tn[] = { "royal", "stalemate", "repetition", "no-progress", "ply-cap",
-                                        "resignation" };
-            /* Count against whichever limit is in force. --first-game only shifts the
-             * per-game seed and is not stored anywhere, so name the absolute index when
-             * it is set or a game cannot be reproduced from the log alone. */
-            char head[96], from[48] = "";
-            if (first_game)
-                snprintf(from, sizeof(from), " (game index %llu)",
-                         (unsigned long long)(first_game + gi));
-            if (target_positions)
-                snprintf(head, sizeof(head), "Game %llu, Positions %llu/%llu",
-                         (unsigned long long)(gi + 1), (unsigned long long)total_plies,
-                         (unsigned long long)target_positions);
-            else
-                snprintf(head, sizeof(head), "Game %llu/%llu",
-                         (unsigned long long)(gi + 1), (unsigned long long)games);
-            /* Extrapolate from the whole run so far, against whichever limit is in force.
-             * Per position rather than per game when counting positions, since game
-             * lengths vary by an order of magnitude and the position rate is far steadier. */
-            char eta[48] = "";
-            double elapsed = now_s() - t_start, remain = 0.0;
-            if (target_positions && total_plies && total_plies < target_positions)
-                remain = elapsed / (double)total_plies * (double)(target_positions - total_plies);
-            else if (!target_positions && gi + 1 < games)
-                remain = elapsed / (double)(gi + 1) * (double)(games - gi - 1);
-            if (remain > 0.0) {
-                char d[32];
-                fmt_dur(remain, d, sizeof(d));
-                snprintf(eta, sizeof(eta), "  ETA %s", d);
-            }
-            fprintf(stderr, "%s%s: %d plies, %s by %s, %.1fs (%.0f boards/s)%s\n",
-                    head, from, nply,
-                    result == RES_BLACK ? "black" : result == RES_WHITE ? "white" : "draw",
-                    tn[term], now_s() - t_game,
-                    total_evals / (t_nn > 0 ? t_nn : 1.0), eta);
-        }
-    }
-
-    if (cfg.out_path) tkn_close(&sink, games_done, total_plies);
-    if (cfg.children_path) kids_close(&kids);
-
-    double dt = now_s() - t_start;
-    fprintf(stderr,
-        "games=%llu plies=%llu (%.1f/game) evals=%llu\n"
-        "  %.1fs total, %.1fs in the network (%.0f%%), %.0f boards/s, %.2f s/ply\n"
-        "  policy %.3fs (%.2f%%)  movegen %.3fs (%.2f%%)  encode %.3fs (%.2f%%)  king safety "
-        "%.3fs (%.2f%%)  other %.3fs (%.2f%%)\n"
-        "  black=%llu white=%llu draw=%llu\n",
-        (unsigned long long)games_done, (unsigned long long)total_plies,
-        games_done ? (double)total_plies / games_done : 0.0, (unsigned long long)total_evals,
-        dt, t_nn, 100.0 * t_nn / (dt > 0 ? dt : 1.0),
-        t_nn > 0 ? total_evals / t_nn : 0.0, total_plies ? dt / total_plies : 0.0,
-        t_pol, 100 * t_pol / dt, t_gen, 100 * t_gen / dt, t_enc, 100 * t_enc / dt, t_safe,
-        100 * t_safe / dt, dt - t_nn - t_gen - t_enc - t_safe - t_pol,
-        100 * (dt - t_nn - t_gen - t_enc - t_safe - t_pol) / dt,
-        (unsigned long long)wins[RES_BLACK], (unsigned long long)wins[RES_WHITE],
-        (unsigned long long)wins[RES_DRAW]);
-    if (cfg.king_safety)
-        fprintf(stderr, "  king safety changed the pick on %llu plies (%.2f%%); %llu plies had no "
-                        "safe move at all\n",
-                (unsigned long long)sc.overridden,
-                total_plies ? 100.0 * sc.overridden / total_plies : 0.0,
-                (unsigned long long)sc.hopeless);
-    if (have_nvml) {
-        double gu, gm, used, tot;
-        gpumon_take(&mon, &gu, &gm, &used, &tot);
-        if (gu >= 0)
-            fprintf(stderr, "  gpu busy %.1f%% of the last interval, memory bus %.1f%%, "
-                            "vram %.2f/%.2f GB\n"
-                            "  (NVML \"busy\" is the share of time a kernel was resident, not how much\n"
-                            "   arithmetic it used -- the sub-batch curve going flat is the saturation test)\n",
-                    gu, gm, used, tot);
-    }
-    gpumon_stop(&mon);
-
-    pol_close(&pol);
-    free(plybuf); scratch_free(&sc);
-    free(rep); free(base); free(p); free(sink.buf);
     net_close(&net);
-    return 0;
+    return rc;
 }

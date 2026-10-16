@@ -3,16 +3,18 @@
 Four independent checks, all against code that is not nnplay.c:
 
   encode    nnplay's encode_stm vs unpack.canonical_board + unpack.embedding_index, on
-            real positions of both colours from the existing corpus
+            real positions of both colours from a self-play game
   replay    every stored board is the previous board with the stored move applied, using
             unpack.apply_move -- which is game.js's Board.move, not nnplay's do_move
   values    every stored value re-evaluated through the network reproduces the stored one,
-            which is the claim that a record's value belongs to that record's board
+            which is the claim that a record's value belongs to that record's board. That
+            holds for the one-ply search (--sims 0), which stores the network's value; a
+            search stores its Q, so its game is checked by replay alone
   torch     nnplay eval vs torch on the same boards, so the ONNX export, the attention
             fusion and the C plumbing are covered end to end
 
-Run it as `python3 test_nnplay.py SHARD.tkn`; without an argument it plays a short game
-first.
+Run it as `python3 test_nnplay.py SHARD.tkn`, a shard written at --sims 0; without an
+argument it plays short games first, one-ply and searched.
 """
 import subprocess
 import sys
@@ -20,8 +22,8 @@ import tempfile
 
 import numpy as np
 
-from unpack import (unpack, apply_move, canonical_board, embedding_index, EMPTY_IDX,
-                    INIT_BOARD, rot180_move)
+from unpack import (apply_move, canonical_board, embedding_index, EMPTY_IDX, INIT_BOARD,
+                    rot180_move)
 from unpack_nn import unpack_nn, games, NSQ
 
 NNPLAY = "./nnplay"
@@ -41,18 +43,19 @@ def nnplay(args, stdin=None):
     return r.stdout
 
 
-def test_encode(n=40):
+def test_encode(path, n=40):
     """The C and python canonicalisations must agree square for square, both colours."""
     bad = seen = 0
     sides = set()
-    for board, info in unpack("shard_0000.tkp", canonical=False, limit=n):
-        sides.add(int(info.side_to_move))
+    for board, info in unpack_nn(path, canonical=False, limit=n):
+        stm = 1 - info.side
+        sides.add(stm)
         flat = board.reshape(-1)
         lines = ["clear"] + [f"{sq} {c>>2} {(c>>1)&1} {c&1}"
                              for sq, c in enumerate(int(v) for v in flat) if (c >> 2) != EMPTY_IDX]
-        lines.append(f"turn {info.side_to_move}")
+        lines.append(f"turn {stm}")
         got = np.array([int(v) for v in nnplay(["encode"], "\n".join(lines) + "\n").split()])
-        want = embedding_index(canonical_board(board, info.side_to_move)).reshape(-1)
+        want = embedding_index(canonical_board(board, stm)).reshape(-1)
         seen += 1
         bad += not np.array_equal(got, want)
     check("encode_stm == canonical_board + embedding_index", bad == 0 and len(sides) == 2,
@@ -78,6 +81,8 @@ def test_values(path, precision, extra, limit=64):
     """Feed the stored boards back through the network and expect the stored values."""
     rows, want = [], []
     for board, info in unpack_nn(path, limit=limit):
+        if info.forced_king_capture:       # stored exactly: the side to move has lost
+            continue
         rows.append(embedding_index(board).reshape(-1))
         want.append(info.value)
     out = nnplay(["eval", "--precision", precision, "--quiet"] + extra,
@@ -89,14 +94,13 @@ def test_values(path, precision, extra, limit=64):
           f"{len(want)} plies, max deviation {d:.2e}")
 
 
-def test_torch(precision, extra, n=16):
+def test_torch(path, precision, extra, n=16):
     """nnplay eval against torch, on the same boards."""
     import torch
-    from model import TaikyokuShogiBot
+    from export_onnx import load
     torch.backends.mha.set_fastpath_enabled(False)
-    net = TaikyokuShogiBot().eval()
-    net.load_state_dict(torch.load("checkpoint.pt", map_location="cpu", weights_only=False)["model"])
-    rows = np.stack([embedding_index(b).reshape(-1) for b, _ in unpack("shard_0000.tkp", limit=n)])
+    net, _ = load("checkpoint.pt", "cpu")
+    rows = np.stack([embedding_index(b).reshape(-1) for b, _ in unpack_nn(path, limit=n)])
     with torch.no_grad():
         want = np.concatenate([net(torch.from_numpy(rows[i:i + 4]).long())[0].numpy().ravel()
                                for i in range(0, len(rows), 4)])
@@ -177,24 +181,29 @@ def test_symmetry(path):
 
 def main():
     path = sys.argv[1] if len(sys.argv) > 1 else None
-    tmp = None
+    searched = None
     if path is None:
-        tmp = tempfile.NamedTemporaryFile(suffix=".tkn", delete=False)
-        path = tmp.name
-        print(f"playing a short game into {path}")
-        nnplay(["play", "--games", "2", "--max-plies", "6", "--quiet", "--out", path])
+        path = tempfile.NamedTemporaryFile(suffix=".tkn", delete=False).name
+        searched = tempfile.NamedTemporaryFile(suffix=".tkn", delete=False).name
+        print(f"playing short games into {path} (one-ply) and {searched} (search)")
+        nnplay(["play", "--games", "2", "--max-plies", "12", "--sims", "0", "--quiet", "--out", path])
+        nnplay(["play", "--games", "2", "--max-plies", "12", "--sims", "16", "--parallel-games", "2",
+                "--quiet", "--out", searched])
 
     n_games = len(list(games(path)))
     n_plies = sum(1 for _ in unpack_nn(path))
     print(f"{path}: {n_games} games, {n_plies} plies")
 
     test_elo_estimator()
-    test_encode()
+    test_encode(path)
     test_replay(path)
     test_symmetry(path)
+    if searched:
+        test_replay(searched)
+        test_symmetry(searched)
     test_values(path, "fp16", [])
-    test_torch("fp16", [])
-    test_torch("fp32", ["--no-tf32"])
+    test_torch(path, "fp16", [])
+    test_torch(path, "fp32", ["--no-tf32"])
 
     print(f"\n{len(fails)} failed" if fails else "\nall checks passed")
     return 1 if fails else 0

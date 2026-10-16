@@ -30,8 +30,8 @@ Self-play, with live output:
 ```python
 import subprocess as _sp_play
 _play = _sp_play.Popen(
-    ["./nnplay", "play", "--games", "20", "--max-plies", "400", "--sub-batch", "32",
-     "--temperature", "0.3", "--progress-every", "25", "--out", "selfplay.tkn"],
+    ["./nnplay", "play", "--games", "64", "--max-plies", "400", "--sims", "128",
+     "--temperature", "1.0", "--out", "selfplay.tkn", "--children", "selfplay.kids"],
     cwd="/marimo/nnplay-bundle", stdout=_sp_play.PIPE, stderr=_sp_play.STDOUT,
     text=True, bufsize=1)
 for _play_line in _play.stdout:
@@ -45,7 +45,7 @@ Elo against the baseline (add `"--baseline", "random"` if the bundle has no
 ```python
 import subprocess as _sp_elo
 _elo = _sp_elo.Popen(
-    ["./nnplay", "elo", "--games", "200", "--sub-batch", "32", "--temperature", "0.3"],
+    ["./nnplay", "elo", "--sims", "128", "--opening-plies", "8", "--opening-temperature", "1.0"],
     cwd="/marimo/nnplay-bundle", stdout=_sp_elo.PIPE, stderr=_sp_elo.STDOUT,
     text=True, bufsize=1)
 for _elo_line in _elo.stdout:
@@ -53,7 +53,7 @@ for _elo_line in _elo.stdout:
 print("elo exit code:", _elo.wait())
 ```
 
-Use the `--sub-batch` the self-check printed.
+Pass the `--sub-batch` the self-check printed to skip the startup probe.
 
 ## If it stops
 

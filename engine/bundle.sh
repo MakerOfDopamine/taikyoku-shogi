@@ -38,20 +38,12 @@ cp tkykids.c "$OUT"/
 # The header only. The C API is versioned inside it and newer runtimes still serve older
 # API versions, so it works with whichever onnxruntime-gpu setup.sh downloads.
 cp third_party/onnxruntime/include/onnxruntime_c_api.h "$OUT"/
+# the model graph, value and policy in one pass; nnplay refuses the old value-only export
 cp net_fp16.onnx net_fp16_raw.onnx "$OUT"/
-# the policy graph: play, elo and variance refuse a model without one
-if [ -f net_fp16_policy.onnx ]; then
-    cp net_fp16_policy.onnx "$OUT"/
-    [ -f net_fp16_policy_raw.onnx ] && cp net_fp16_policy_raw.onnx "$OUT"/
-else
-    echo "  (no net_fp16_policy.onnx: this is a legacy model, and nnplay play/elo/variance will"
-    echo "   refuse it. Export a model_policy.py checkpoint with export_onnx.py first)"
-fi
 if [ "$FP32" = 1 ]; then cp net_fp32.onnx "$OUT"/; fi
 # the Elo baseline, when one has been exported
 if [ -f baseline_fp16.onnx ]; then
     cp baseline_fp16.onnx "$OUT"/
-    [ -f baseline_fp16_policy.onnx ] && cp baseline_fp16_policy.onnx "$OUT"/
     if [ "$FP32" = 1 ] && [ -f baseline_fp32.onnx ]; then cp baseline_fp32.onnx "$OUT"/; fi
 else
     echo "  (no baseline_fp16.onnx: 'nnplay elo' in this bundle will need --baseline random)"
@@ -60,12 +52,11 @@ cp unpack.py unpack_nn.py tables.json fuse.py net_manifest.json "$OUT"/
 cp bundle_setup.sh "$OUT"/setup.sh
 chmod +x "$OUT"/setup.sh
 
-if [ "$TESTS" = 1 ]; then
-    cp test_nnplay.py model.py checkpoint.pt "$OUT"/
-    cp shard_0000.tkp "$OUT"/ 2>/dev/null || echo "  (no shard_0000.tkp: the encode and torch checks need one)"
+if [ "$TESTS" = 1 ] || [ "$EXPORT" = 1 ]; then
+    cp export_onnx.py export_rewrite.py model_policy.py checkpoint.pt "$OUT"/
 fi
+if [ "$TESTS" = 1 ]; then cp test_nnplay.py "$OUT"/; fi
 if [ "$EXPORT" = 1 ]; then
-    cp export_onnx.py export_rewrite.py model.py model_policy.py checkpoint.pt "$OUT"/
     if [ -f baseline.pt ]; then cp baseline.pt "$OUT"/; fi
 fi
 
@@ -102,8 +93,8 @@ Self-play, with live output:
 ```python
 import subprocess as _sp_play
 _play = _sp_play.Popen(
-    ["./nnplay", "play", "--games", "20", "--max-plies", "400", "--sub-batch", "32",
-     "--temperature", "0.3", "--progress-every", "25", "--out", "selfplay.tkn"],
+    ["./nnplay", "play", "--games", "64", "--max-plies", "400", "--sims", "128",
+     "--temperature", "1.0", "--out", "selfplay.tkn", "--children", "selfplay.kids"],
     cwd="/marimo/nnplay-bundle", stdout=_sp_play.PIPE, stderr=_sp_play.STDOUT,
     text=True, bufsize=1)
 for _play_line in _play.stdout:
@@ -117,7 +108,7 @@ Elo against the baseline (add `"--baseline", "random"` if the bundle has no
 ```python
 import subprocess as _sp_elo
 _elo = _sp_elo.Popen(
-    ["./nnplay", "elo", "--games", "200", "--sub-batch", "32", "--temperature", "0.3"],
+    ["./nnplay", "elo", "--sims", "128", "--opening-plies", "8", "--opening-temperature", "1.0"],
     cwd="/marimo/nnplay-bundle", stdout=_sp_elo.PIPE, stderr=_sp_elo.STDOUT,
     text=True, bufsize=1)
 for _elo_line in _elo.stdout:
@@ -125,7 +116,7 @@ for _elo_line in _elo.stdout:
 print("elo exit code:", _elo.wait())
 ```
 
-Use the `--sub-batch` the self-check printed.
+Pass the `--sub-batch` the self-check printed to skip the startup probe.
 
 ## If it stops
 

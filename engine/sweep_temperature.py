@@ -115,8 +115,7 @@ def run_play(a, scheds):
         shard = os.path.join(a.out_dir, f"{tag}.tkn")
         if not (a.reuse and os.path.exists(shard)):
             cmd = [a.nnplay, "play", "--games", str(a.games), *schedule_args(t0, n0, T),
-                   "--max-plies", str(a.max_plies),
-                   "--policy-top", str(a.policy_top),
+                   "--max-plies", str(a.max_plies), "--sims", "0",
                    "--quiet", "--out", shard] + a.extra.split()
             print(f"[{time.strftime('%H:%M:%S')}] {tag}: {' '.join(cmd)}", flush=True)
             start = time.time()
@@ -280,7 +279,7 @@ def run_variance_jobs(a, sched, p):
                *schedule_args(*sched),
                "--branch-every", str(p["stride"]), "--branches", str(a.branches),
                "--max-points", str(a.max_points), "--max-plies", str(a.max_plies),
-               "--policy-top", str(a.policy_top), "--csv", part] + a.extra.split()
+               "--csv", part] + a.extra.split()
         if not procs:
             print(f"[{time.strftime('%H:%M:%S')}] {tag}: {' '.join(cmd)}"
                   + (f"  (x{a.jobs} jobs)" if a.jobs > 1 else ""), flush=True)
@@ -469,8 +468,6 @@ def main():
     ap.add_argument("--games", type=int, default=None,
                     help="games per schedule (default 40 in play mode, 200 in variance mode)")
     ap.add_argument("--max-plies", type=int, default=1000)
-    ap.add_argument("--policy-top", type=float, default=0.05,
-                    help="the value head scores the policy's top this much of the moves")
     ap.add_argument("--out-dir", default="sweep")
     ap.add_argument("--nnplay", default="./nnplay")
     ap.add_argument("--extra", default="", help="extra nnplay arguments, space separated")

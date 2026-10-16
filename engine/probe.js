@@ -23,7 +23,7 @@ function run(cells, turn) {
         p.promoted = !!pr
         grid[Math.floor(sq / 36)][sq % 36] = p
     }
-    const g = new Game(new Board(grid))
+    const g = new Game(new Board({ board: grid, turn }))
     g.turn = turn
     const jmoves = g.all_legal_moves().map(([x, y, m]) => ((x * 36 + y) << 14) | m)
     const a = new Set(cmoves), b = new Set(jmoves)

@@ -54,7 +54,7 @@ class Tkn:
         side_black      absolute: 1 if black made this move
         value           the net's value of this board, in its side-to-move frame
         n_legal         legal moves the mover chose from
-        n_scored        children actually evaluated (== n_legal unless --subset-fraction)
+        n_scored        network evaluations the move cost
         material        pawns after this move: black minus white, or side to move minus
                         opponent once canonical
         final_material  the balance the game ended on, in the same frame as ``material``
@@ -250,14 +250,16 @@ class Tkn:
     def header(path):
         import struct
         with open(path, "rb") as f:
-            raw = f.read(Tkn.FILE_HDR)
-        if len(raw) != Tkn.FILE_HDR or raw[:8] != Tkn.MAGIC:
+            raw = f.read(256)                     # 128 bytes before version 7
+        if len(raw) < Tkn.FILE_HDR or raw[:8] != Tkn.MAGIC:
             raise ValueError(f"not a .tkn shard (magic {raw[:8]!r})")
         u32 = lambda o: struct.unpack_from("<I", raw, o)[0]
         u64 = lambda o: struct.unpack_from("<Q", raw, o)[0]
-        if u32(12) != Tkn.FILE_HDR or u32(16) != Tkn.GAME_HDR or u32(20) != Tkn.REC:
+        f32 = lambda o: struct.unpack_from("<f", raw, o)[0]
+        if u32(12) not in (Tkn.FILE_HDR, 256) or u32(16) != Tkn.GAME_HDR or u32(20) != Tkn.REC:
             raise ValueError(f"unexpected record sizes {u32(12)}/{u32(16)}/{u32(20)}")
-        return {"version": u32(8), "value_fp": u32(24), "mat_shift": u32(28),
+        v7 = u32(8) >= 7
+        return {"version": u32(8), "header_size": u32(12), "value_fp": u32(24), "mat_shift": u32(28),
                 "seed_base": u64(32), "games": u64(40), "plies": u64(48),
                 "temperature": struct.unpack_from("<d", raw, 56)[0],
                 "max_plies": u32(64), "rep_limit": u32(68), "no_progress_limit": u32(72),
@@ -276,11 +278,25 @@ class Tkn:
                 # legal moves, plus this much at random
                 "policy_top": (u32(100) >> 16) / 1000 if u32(8) >= 6 else None,
                 "policy_explore": ((u32(100) >> 8) & 0xFF) / 1000 if u32(8) >= 6 else None,
+                # games that reached the ply cap were not written
+                "drop_capped": (u32(100) >> 1) & 1,
+                # random sparse starts, not the opening; only royal captures were written
+                "endgames": (u32(100) >> 2) & 1,
                 # 92..95 held NSQ before version 2; from 2 on it is the opening schedule
                 "opening_plies": struct.unpack_from("<H", raw, 92)[0] if u32(8) >= 2 else 0,
                 "opening_temperature": (struct.unpack_from("<H", raw, 94)[0] / 1000.0
                                         if u32(8) >= 2 else None),
-                "model": raw[104:128].split(b"\x00")[0].decode()}
+                "model": raw[104:128].split(b"\x00")[0].decode(),
+                # version 7 on: the search, sims 0 the one-ply search
+                "sims": u32(128) if v7 else 0, "leaves": u32(132) if v7 else 0,
+                "cpuct": f32(136) if v7 else 0.0, "noise_frac": f32(140) if v7 else 0.0,
+                "noise_alpha": f32(144) if v7 else 0.0, "games_par": u32(148) if v7 else 1,
+                "opp_sims": u32(152) if v7 else 0, "contempt": f32(160) if v7 else 0.0,
+                "contempt_flat": (u32(156) >> 3) & 1 if v7 else 0,
+                # play --selfplay-soft-target-scale: a capped or repeated game's training
+                # label is soft_scale * tanh(material / soft_pawns), in its game header
+                "soft_scale": f32(164) if u32(12) >= 256 else 0.0,
+                "soft_pawns": f32(168) if u32(12) >= 256 else 0.0}
 
     MATERIAL_OFF = 1296 * 2 + 4 + 4 + 2   # board, move, value, n_legal: then i16 material
 
@@ -291,9 +307,10 @@ class Tkn:
         import os
         import struct
         for p in Tkn.shards(path):
-            shift = Tkn.header(p)["mat_shift"]
+            h = Tkn.header(p)
+            shift = h["mat_shift"]
             with open(p, "rb") as f:
-                f.seek(Tkn.FILE_HDR)
+                f.seek(h["header_size"])
                 gi = 0
                 while True:
                     gh = f.read(Tkn.GAME_HDR)
@@ -301,13 +318,16 @@ class Tkn:
                         break
                     n_plies, result, term = struct.unpack_from("<IbB", gh, 0)
                     seed = struct.unpack_from("<Q", gh, 8)[0]
+                    label = (struct.unpack_from("<h", gh, 6)[0] / 10000 if h["soft_scale"] > 0
+                             else float(result))
                     final = 0.0
                     if n_plies:
                         f.seek((n_plies - 1) * Tkn.REC + Tkn.MATERIAL_OFF, os.SEEK_CUR)
                         final = struct.unpack("<h", f.read(2))[0] / (1 << shift)
                         f.seek(Tkn.REC - Tkn.MATERIAL_OFF - 2, os.SEEK_CUR)
                     yield {"path": p, "game_index": gi, "seed": seed, "n_plies": n_plies,
-                           "result": result, "termination": Tkn.TERM_NAMES[term],
+                           "result": result, "label": label,
+                           "termination": Tkn.TERM_NAMES[term],
                            "final_material": final}
                     gi += 1
 
@@ -324,7 +344,7 @@ class Tkn:
         for p in Tkn.shards(path):
             hdr = Tkn.header(p)
             with open(p, "rb") as f:
-                f.seek(Tkn.FILE_HDR)
+                f.seek(hdr["header_size"])
                 gi = 0
                 while True:
                     gh = f.read(Tkn.GAME_HDR)
@@ -348,7 +368,8 @@ class Tkn:
                             move=Tkn.unpack_move(int(r["move"])),
                             value=float(r["value"]), n_legal=int(r["n_legal"]),
                             # 0 was the reserved pad before --subset-fraction existed
-                            n_scored=int(r["n_scored"]) or int(r["n_legal"]),
+                            n_scored=int(r["n_scored"]) if hdr["version"] >= 7
+                                     else int(r["n_scored"]) or int(r["n_legal"]),
                             material=float(r["material"]) / (1 << hdr["mat_shift"]),
                             final_material=final,
                             result=int(result), result_black=int(result),

@@ -6,18 +6,22 @@ def _train_policy():
     MODEL_DIR = "."                    # where model_policy.py lives
     ENGINE_DIR = "."                   # tky.c, tables.h, tkykids.c: built into the move
                                        # generator for archives that have no .kids file
-    CHECKPOINT_IN = "checkpoint_policy.pt"     # e.g. the distillation cell's output
-    CHECKPOINT_OUT = "checkpoint_policy2.pt"
+    CHECKPOINT_IN = "3.pt"     # e.g. the distillation cell's output
+    CHECKPOINT_OUT = "4.pt"
     LOAD_OPTIMIZER = True
     BATCH_SIZE = 64
     STEP_SIZE = 256 // 64              # batches accumulated per optimizer step
     LR, WEIGHT_DECAY = 3e-4, 0.01
     EPOCHS = 1
     MAX_STEPS = None                   # optimizer steps; None = the whole epoch(s)
-    GAMMA, LAMBDA = 0.999, 0.99        # the value head's TD(lambda) target, as engine_marimo
+    GAMMA, LAMBDA = 0.999, 0.99        # the value head's TD(lambda) target
     POLICY_WEIGHT = 1.0                # total loss = value MSE + POLICY_WEIGHT * policy CE
-    POLICY_TEMPERATURE = 0.3           # target = softmax(-child value / T), what nnplay samples
+    POLICY_TEMPERATURE = 0.5           # target = softmax(-child value / T), what nnplay samples
+    PASS_WEIGHT = 0.25                 # a pass's share of the policy target is multiplied by
+                                       # this before renormalising; 1.0 leaves targets alone
     ONFLY_CHILDREN = 16                # children scored per position when there is no .kids
+    CAP_SHARE = 0.5                    # share of training draws from games that ended at the
+                                       # ply cap; None draws every position equally
     EVAL_GAME_FRACTION = 0.02          # games held out for the recall report
     EVAL_POSITIONS = 2000
     EVAL_EVERY = 500                   # optimizer steps between reports
@@ -36,16 +40,29 @@ def _train_policy():
     # only the policy's top few instead of hundreds of children.
     #
     # Children come from a .kids side file (nnplay play --children) where an archive has
-    # one: every child the search scored, with the value it got, so the policy learns from
-    # values that cost nothing extra. Archives without one fall back to generating the
-    # legal moves here and scoring ONFLY_CHILDREN of them with the model's own value head.
+    # one. After a search (version 2) they are the root's visited children, and the policy
+    # target is AlphaZero's: visits / total over every legal move, unvisited moves at zero.
+    # From the one-ply search (version 1) they are every child the value head scored, and
+    # the target is softmax(-value / POLICY_TEMPERATURE) over those. Archives without a
+    # .kids fall back to generating the legal moves here and scoring ONFLY_CHILDREN of them
+    # with the model's own value head.
+    # Passes -- a Lion stepping out and back over an empty square -- have their target share
+    # cut by PASS_WEIGHT first: the search's visits followed the policy's liking for them,
+    # so training on those visits grew it every generation, and it ended games in mutual
+    # passing and repetition.
     #
-    # The report ranks each held-out position's children by the policy and asks what the
-    # search would get if it evaluated only the policy's top q of them: whether the value
-    # head's best child is in there, how much of the target softmax is, and how much value
-    # is given up against the best child. Each row sits above what a random pick of the
+    # The report ranks each held-out position's recorded children by the policy and asks
+    # what the search would get if it looked at only the policy's top q of them: whether
+    # the target's top child (the best value, or the most visited) is in there, how much of
+    # the target is, and how much value is given up against the best child. Each row sits above what a random pick of the
     # same size would get. A second report does the same over every legal move of a few
     # positions, which is the question that matters for cutting the search down.
+    #
+    # Games that reach the ply cap all run its full length, so they supply most of the
+    # positions (79% of one T=0.05 batch, from 40% of its games). Training therefore draws
+    # positions at random, CAP_SHARE of the draws from capped games and the rest from every
+    # other game, each position equally likely within its group. An epoch is as many draws
+    # as there are training positions, so some positions repeat and others are skipped.
     #
     # Games appearing twice -- an archive beside its own unpacked .tkn, a merged file
     # beside its sources -- are counted once, matched by seed, length and move sequence.
@@ -67,7 +84,10 @@ def _train_policy():
     DT = np.dtype([("board", "<u2", (1296,)), ("move", "<u4"), ("value", "<f4"),
                    ("n_legal", "<u2"), ("material", "<i2"), ("side", "u1"), ("flags", "u1"),
                    ("n_scored", "<u2")])
-    KID = np.dtype([("move", "<u4"), ("value", "<f2")])
+    # .kids version 1: every child the one-ply search scored; version 2: every root child
+    # the search visited, with its visits
+    KID = {1: np.dtype([("move", "<u4"), ("value", "<f2")]),
+           2: np.dtype([("move", "<u4"), ("visits", "<u2"), ("value", "<f2")])}
     device = "cuda" if torch.cuda.is_available() else "cpu"
     rng = np.random.default_rng(SEED)
     torch.manual_seed(SEED)
@@ -124,14 +144,14 @@ def _train_policy():
             chunk = games[c:c + 1000]
             L = np.array([g[1] for g in chunk])
             M = np.zeros((len(chunk), max(1, int(L.max()))), np.uint32)
-            for gi, (off, n, _r, _s) in enumerate(chunk):
+            for gi, (off, n, _r, _s, _t) in enumerate(chunk):
                 M[gi, :n] = np.ndarray((n,), DT, buffer=mm, offset=off)["move"]
             out[c:c + len(chunk)] = fnv_games(M, L)
         return out
 
     # the unpacked archives, plus whatever bare .tkn and .kids files sit in DATA_DIR itself
     sources = dirs + [DATA_DIR]
-    tkn_maps, kids_maps = [], []
+    tkn_maps, kids_maps, kids_ver = [], [], []
     kids_by_key = {}                       # (seed, n_plies, move hash) -> children, any file
     for d in sources:
         for kp in sorted(glob.glob(os.path.join(d, "*.kids"))):
@@ -141,6 +161,8 @@ def _train_policy():
                 continue
             ki = len(kids_maps)
             kids_maps.append(km)
+            ver, _hs, child = struct.unpack_from("<III", km, 8)
+            kids_ver.append(ver)
             p = 32
             while p + 24 <= len(km):
                 n, _r, seed, hsh = struct.unpack_from("<IIQQ", km, p)
@@ -150,14 +172,14 @@ def _train_policy():
                 for i in range(n):
                     c = struct.unpack_from("<H", km, p)[0]
                     offs[i], cnts[i] = p + 2, c
-                    p += 2 + 6 * c
+                    p += 2 + child * c
                 if p > len(km):
                     break                         # a truncated last game
                 kids_by_key[(seed, n, hsh)] = (ki, offs, cnts)
 
-    pos_file, pos_off, pos_stm, pos_label, pos_game = [], [], [], [], []
+    pos_file, pos_off, pos_stm, pos_label, pos_game, pos_cap = [], [], [], [], [], []
     pos_kfile, pos_koff, pos_kn = [], [], []
-    n_games = dup_games = n_bare = 0
+    n_games = dup_games = n_bare = cap_games = soft_games = 0
     seen = set()
     t0 = time.time()
     for d in sources:
@@ -170,16 +192,20 @@ def _train_policy():
             tkn_maps.append(mm)
             n_bare += d is DATA_DIR
             games = []
-            p = 128
+            p = struct.unpack_from("<I", mm, 12)[0]      # the header: 128 bytes, 256 from v7
+            # --selfplay-soft-target-scale: each game header carries its label in 1/10000
+            soft = p >= 256 and struct.unpack_from("<f", mm, 164)[0] > 0
             while p + 16 <= len(mm):
-                n, res = struct.unpack_from("<Ib", mm, p)
+                n, res, term = struct.unpack_from("<IbB", mm, p)
+                if soft:
+                    res = struct.unpack_from("<h", mm, p + 6)[0] / 10000
                 seed = struct.unpack_from("<Q", mm, p + 8)[0]
                 if p + 16 + n * REC > len(mm):
                     break                         # a killed run's half-written game
-                games.append((p + 16, n, res, seed))
+                games.append((p + 16, n, res, seed, term))
                 p += 16 + n * REC
             hashes = fnv_file(mm, games) if kids_by_key and games else None
-            for gi, (off, n, res, seed) in enumerate(games):
+            for gi, (off, n, res, seed, term) in enumerate(games):
                 if n < 2:
                     continue
                 recs = np.ndarray((n,), DT, buffer=mm, offset=off)
@@ -204,6 +230,9 @@ def _train_policy():
                 pos_stm.append(stm[:-1].astype(np.int8))
                 pos_label.append(labels.astype(np.float32))
                 pos_game.append(np.full(n - 1, n_games, np.int64))
+                pos_cap.append(np.full(n - 1, term == 4))          # 4: ended at the ply cap
+                cap_games += term == 4
+                soft_games += soft and term in (2, 4)              # repetition, ply cap
                 if kid is not None:                # record k's children are ply k+1's
                     pos_kfile.append(np.full(n - 1, kid[0], np.int32))
                     pos_koff.append(kid[1][1:])
@@ -217,22 +246,26 @@ def _train_policy():
         raise RuntimeError("no positions found")
     pos_file, pos_off = np.concatenate(pos_file), np.concatenate(pos_off)
     pos_stm, pos_label = np.concatenate(pos_stm), np.concatenate(pos_label)
-    pos_game = np.concatenate(pos_game)
+    pos_game, pos_cap = np.concatenate(pos_game), np.concatenate(pos_cap)
     pos_kfile, pos_koff, pos_kn = np.concatenate(pos_kfile), np.concatenate(pos_koff), np.concatenate(pos_kn)
     N = len(pos_label)
     rec_kids = pos_kfile >= 0
     say(f"{n_games} games, {N} positions from {len(tkn_maps)} .tkn file(s) ({len(archives)} "
         f"archive(s), {n_bare} bare) in {time.time() - t0:.0f}s"
-        + (f"; {dup_games} duplicate games skipped" if dup_games else ""))
+        + (f"; {dup_games} duplicate games skipped" if dup_games else "")
+        + (f"; {soft_games} capped or repeated games labelled on material" if soft_games else ""))
+    searched = np.zeros(N, bool)
+    searched[rec_kids] = np.array(kids_ver)[pos_kfile[rec_kids]] == 2
     say(f"{rec_kids.mean():.1%} of positions have recorded children "
-        f"(mean {pos_kn[rec_kids].mean() if rec_kids.any() else 0:.0f} each); the rest get "
-        f"{ONFLY_CHILDREN} sampled children scored by this model")
+        f"(mean {pos_kn[rec_kids].mean() if rec_kids.any() else 0:.0f} each), "
+        f"{searched.mean():.1%} from a search, whose visits are the policy target over every "
+        f"legal move; the rest get {ONFLY_CHILDREN} sampled children scored by this model")
     say(f"value labels: mean {pos_label.mean():+.4f} sd {pos_label.std():.4f} "
         f"max |label| {np.abs(pos_label).max():.3f}")
 
     # ---- the move generator, only if some positions need it -------------------------
     lib = None
-    if (~rec_kids).any() or FULL_EVAL_POSITIONS > 0:
+    if (~rec_kids).any() or searched.any() or FULL_EVAL_POSITIONS > 0:
         so = os.path.abspath(os.path.join(CACHE_DIR, "libtkykids.so"))
         src = os.path.join(ENGINE_DIR, "tkykids.c")
         if not os.path.exists(so) or (os.path.exists(src) and os.path.getmtime(src) > os.path.getmtime(so)):
@@ -256,8 +289,7 @@ def _train_policy():
 
     # ---- the model ------------------------------------------------------------------
     sys.path.insert(0, os.path.abspath(MODEL_DIR))
-    from model_policy import TaikyokuShogiBot as _PolicyBot
-    model = _PolicyBot().to(device)
+    model = NewBot().to(device)
     opt = torch.optim.AdamW(model.parameters(), LR, weight_decay=WEIGHT_DECAY)
     if CHECKPOINT_IN and os.path.exists(CHECKPOINT_IN):
         ck = torch.load(CHECKPOINT_IN, map_location=device, weights_only=True)
@@ -288,6 +320,16 @@ def _train_policy():
             s = np.where((s >= 1) & (s <= 8), (s - 1 + 4) % 8 + 1, s)
         return o.astype(np.int64), t.astype(np.int64), s.astype(np.int64)
 
+    STEP = np.array([36, 37, 1, -35, -36, -37, -1, 35])   # DIRS as square offsets
+
+    def is_pass(cb, o, t, s):
+        """Canonical moves that leave the board unchanged: a Lion's two steps out and back
+        over an empty square. Over an enemy the same move is an igui capture."""
+        m = (s >= 1) & (s <= 8) & (t == o)
+        if m.any():
+            m[m] = (cb[o[m] + STEP[s[m] - 1]] >> 2) == 0
+        return m
+
     def onfly(board, stm, gen):
         """(moves, child boards) for a few children, to be scored by the model's own value head."""
         n = lib.tk_moves(board.ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)), int(stm),
@@ -303,21 +345,34 @@ def _train_policy():
         return pick, kids
 
     def build(idx, fixed=False):
-        """Boards, value labels, and every child's (batch row, from, to, type) with a target.
-        fixed: each position always draws the same on-the-fly children, so reports compare."""
-        boards, rows, frm, to, typ, tval = [], [], [], [], [], []
+        """Boards, value labels, and every child's (batch row, from, to, type) with its value
+        and the target's logit: -value / T, or log visits after a search, where training
+        (not fixed) also adds every unvisited legal move at a target of zero. fixed: the
+        reports' batches, which keep to the recorded children and always draw the same
+        on-the-fly ones, so reports compare."""
+        boards, rows, frm, to, typ, tval, tlog, nul = [], [], [], [], [], [], [], []
         pending = []                                   # on-the-fly children to score
         for r, i in enumerate(idx):
             mm, off, stm = tkn_maps[pos_file[i]], int(pos_off[i]), int(pos_stm[i])
             board = np.frombuffer(mm, np.uint16, 1296, off)
             boards.append(canonical(board, stm))
             if pos_kfile[i] >= 0:
-                n = int(pos_kn[i])
-                if n < 2:
+                n, kf = int(pos_kn[i]), int(pos_kfile[i])
+                v2 = kids_ver[kf] == 2
+                if n < (1 if v2 and not fixed and lib is not None else 2):
                     continue                           # a forced King capture
-                kids = np.frombuffer(kids_maps[pos_kfile[i]], KID, n, int(pos_koff[i]))
+                kids = np.frombuffer(kids_maps[kf], KID[kids_ver[kf]], n, int(pos_koff[i]))
                 vals = kids["value"].astype(np.float32)
                 moves = kids["move"]
+                tl = np.log(kids["visits"].astype(np.float32)) if v2 else -vals / POLICY_TEMPERATURE
+                if v2 and not fixed and lib is not None:
+                    m = lib.tk_moves(np.ascontiguousarray(board).ctypes.data_as(ctypes.POINTER(ctypes.c_uint16)),
+                                     int(stm), movebuf.ctypes.data_as(ctypes.POINTER(ctypes.c_uint32)),
+                                     len(movebuf), ctypes.byref(forced_out))
+                    rest = np.setdiff1d(movebuf[:min(m, len(movebuf))], moves)
+                    moves = np.concatenate([moves, rest])
+                    vals = np.concatenate([vals, np.zeros(len(rest), np.float32)])
+                    tl = np.concatenate([tl, np.full(len(rest), -1e4, np.float32)])
             elif lib is not None:
                 got = onfly(np.ascontiguousarray(board), stm,
                             np.random.default_rng([SEED, int(i)]) if fixed else rng)
@@ -326,16 +381,19 @@ def _train_policy():
                 moves, kid_boards = got
                 pending.append((len(tval), len(moves), kid_boards, 1 - stm))
                 vals = np.zeros(len(moves), np.float32)  # filled in below
+                tl = None
             else:
                 continue
             o, t, s = canon_moves(moves.astype(np.int64), stm)
             rows.append(np.full(len(moves), r, np.int64))
             frm.append(o); to.append(t); typ.append(s)
+            nul.append(is_pass(boards[r], o, t, s))
             tval.append(vals)
+            tlog.append(tl)
         x = embed(boards).to(device)
         y = torch.from_numpy(pos_label[idx]).unsqueeze(-1).to(device)
         if not rows:
-            return x, y, None, None, None
+            return x, y, None, None, None, None
         tvals = np.concatenate(tval)
         if pending:                                    # the model's own value head
             seg = np.concatenate([[0], np.cumsum([len(v) for v in tval])])
@@ -352,10 +410,15 @@ def _train_policy():
             k = 0
             for (seg_i, cnt, _bs, _ks) in pending:
                 tvals[seg[seg_i]:seg[seg_i] + cnt] = out[k:k + cnt]
+                tlog[seg_i] = -out[k:k + cnt] / POLICY_TEMPERATURE
                 k += cnt
         moves = torch.from_numpy(np.stack([np.concatenate(rows), np.concatenate(frm),
                                            np.concatenate(to), np.concatenate(typ)], 1)).to(device)
-        return x, y, moves, torch.from_numpy(tvals).to(device), torch.from_numpy(np.concatenate(rows)).to(device)
+        tl = np.concatenate(tlog).astype(np.float32)
+        if PASS_WEIGHT != 1.0:
+            tl[np.concatenate(nul)] += np.log(PASS_WEIGHT) if PASS_WEIGHT > 0 else -1e4
+        return (x, y, moves, torch.from_numpy(tl).to(device),
+                torch.from_numpy(tvals).to(device), torch.from_numpy(np.concatenate(rows)).to(device))
 
     def segment_softmax_parts(logits, seg_rows, B):
         """Per-position log-softmax of `logits`, positions given by seg_rows (0..B-1)."""
@@ -364,8 +427,8 @@ def _train_policy():
         den = torch.zeros(B, device=logits.device).index_add(0, seg_rows, ex)
         return logits - mx[seg_rows] - torch.log(den[seg_rows])
 
-    def policy_loss(policy, tvals, seg_rows, B):
-        target_logp = segment_softmax_parts(-tvals.float() / POLICY_TEMPERATURE, seg_rows, B)
+    def policy_loss(policy, tlog, seg_rows, B):
+        target_logp = segment_softmax_parts(tlog.float(), seg_rows, B)
         logp = segment_softmax_parts(policy.float(), seg_rows, B)
         ce = -(target_logp.exp() * logp)
         per = torch.zeros(B, device=policy.device).index_add(0, seg_rows, ce)
@@ -385,6 +448,21 @@ def _train_policy():
     say(f"training on {len(train_idx)} positions; held out {int(eval_game.sum())} games for a "
         f"report on {len(eval_idx)} positions' scored children"
         + (f" and {len(full_idx)} positions' every legal move" if len(full_idx) else ""))
+    cap_train = pos_cap[train_idx]
+    draw_p = None
+    if CAP_SHARE is not None and cap_train.any() and not cap_train.all():
+        if not 0.0 <= CAP_SHARE <= 1.0:
+            raise ValueError(f"CAP_SHARE must be in [0, 1], not {CAP_SHARE}")
+        draw_p = np.where(cap_train, CAP_SHARE / cap_train.sum(), (1 - CAP_SHARE) / (~cap_train).sum())
+        draw_p /= draw_p.sum()
+        say(f"ply-cap games: {cap_games} of {n_games} games, {cap_train.mean():.1%} of training "
+            f"positions. Drawn as {CAP_SHARE:.0%} of the batches, so per epoch a capped position "
+            f"comes up {CAP_SHARE / cap_train.mean():.2f}x on average and any other "
+            f"{(1 - CAP_SHARE) / (1 - cap_train.mean()):.2f}x")
+    elif CAP_SHARE is not None:
+        say(f"ply-cap games: {cap_games} of {n_games} games -- "
+            f"{'all' if cap_train.all() else 'none'} of the training positions, so there is "
+            f"nothing to balance and every position is drawn equally")
     QS = (0.05, 0.10, 0.25, 0.50)
 
     def new_acc():
@@ -392,15 +470,15 @@ def _train_policy():
         return {"n": 0, "K": 0, "top1": 0, "kl": 0.0, "spread": 0.0, "rec": z(), "rand": z(),
                 "mass": z(), "ideal": z(), "lost": z(), "rlost": z()}
 
-    def tally(acc, p, v):
-        """One position: policy logits p and the children's values v (lower is better for
-        the side choosing among them)."""
+    def tally(acc, p, v, tl):
+        """One position: policy logits p, the children's values v (lower is better for the
+        side choosing among them), and the target's logits tl."""
         K = len(p)
         order = np.argsort(-p)
         vs = np.sort(v)
         best = vs[0]
-        rank = int(np.nonzero(order == int(np.argmin(v)))[0][0])
-        t = np.exp(-(v - best) / POLICY_TEMPERATURE)
+        rank = int(np.nonzero(order == int(np.argmax(tl)))[0][0])
+        t = np.exp(tl - tl.max())
         t /= t.sum()
         ts = np.sort(t)[::-1]
         acc["n"] += 1
@@ -430,7 +508,7 @@ def _train_policy():
         say(f"\n  [{title}] {n} positions, {acc['K'] / n:.0f} children each on average   "
             f"top-1 {acc['top1'] / n:.1%}   KL {acc['kl'] / n:.3f}")
         say("    evaluating only the policy's top          " + "  ".join(f"{int(q * 100):>6d}%" for q in QS))
-        say("    catches the value head's best child       " + f("rec", pct))
+        say("    catches the target's top child            " + f("rec", pct))
         say("      a random pick of that many would        " + f("rand", pct))
         say("    holds this much of the target softmax     " + f("mass", pct))
         say("      an ideal ordering would hold            " + f("ideal", pct))
@@ -449,26 +527,36 @@ def _train_policy():
         model.eval()
         acc = new_acc()
         vmse = 0.0; nv = 0; n_rec = 0
+        gse = {True: [0.0, 0], False: [0.0, 0]}            # by group: capped, other
         with torch.no_grad():
             for j in range(0, len(eval_idx), BATCH_SIZE):
                 idx = eval_idx[j:j + BATCH_SIZE]
-                x, y, moves, tvals, seg = build(idx, fixed=True)
+                x, y, moves, tlog, tvals, seg = build(idx, fixed=True)
                 value, policy = model(x, moves) if moves is not None else (model(x)[0], None)
-                vmse += float(((value - y) ** 2).sum()); nv += len(idx)
+                se = ((value - y) ** 2).squeeze(-1).float().cpu().numpy()
+                vmse += float(se.sum()); nv += len(idx)
+                for c in gse:
+                    m = pos_cap[idx] == c
+                    gse[c][0] += float(se[m].sum()); gse[c][1] += int(m.sum())
                 n_rec += int(rec_kids[idx].sum())
                 if policy is None:
                     continue
                 pol, tv, sg = policy.float().cpu().numpy(), tvals.float().cpu().numpy(), seg.cpu().numpy()
+                tl = tlog.float().cpu().numpy()
                 for r in np.unique(sg):
                     m = sg == r
-                    tally(acc, pol[m], tv[m])
+                    tally(acc, pol[m], tv[m], tl[m])
         model.train()
         if not acc["n"]:
             return {}
-        say(f"\n  [report, step {step}] value MSE {vmse / nv:.4f} on {nv} held-out positions")
+        group = lambda c: f"{gse[c][0] / gse[c][1]:.4f} on {gse[c][1]}" if gse[c][1] else "none"
+        say(f"\n  [report, step {step}] value MSE {vmse / nv:.4f} on {nv} held-out positions: "
+            f"ply-cap games {group(True)}, others {group(False)}")
         out = show(f"scored children, step {step}: {n_rec} recorded by self-play, "
                    f"{len(eval_idx) - n_rec} sampled and scored by this model", acc)
-        out.update(step=step, value_mse=vmse / nv)
+        out.update(step=step, value_mse=vmse / nv,
+                   value_mse_cap=gse[True][0] / gse[True][1] if gse[True][1] else None,
+                   value_mse_other=gse[False][0] / gse[False][1] if gse[False][1] else None)
         if len(full_idx) and step % FULL_EVAL_EVERY == 0:
             out["full"] = full_report(step)
         return out
@@ -501,7 +589,8 @@ def _train_policy():
                 o, t, sp = canon_moves(moves.astype(np.int64), stm)
                 mv = torch.from_numpy(np.stack([np.zeros(n, np.int64), o, t, sp], 1)).to(device)
                 _, pol = model(embed([canonical(board, stm)]).to(device), mv)
-                tally(acc, pol.float().cpu().numpy(), np.concatenate(vals))
+                vals = np.concatenate(vals)
+                tally(acc, pol.float().cpu().numpy(), vals, -vals / POLICY_TEMPERATURE)
         model.train()
         if not acc["n"]:
             return {}
@@ -520,13 +609,14 @@ def _train_policy():
     run_n = 0
     done = False
     for epoch in range(1, EPOCHS + 1):
-        order = rng.permutation(train_idx)
+        order = rng.choice(train_idx, size=len(train_idx), p=draw_p) if draw_p is not None \
+            else rng.permutation(train_idx)
         for j in range(0, len(order), BATCH_SIZE):
             idx = order[j:j + BATCH_SIZE]
-            x, y, moves, tvals, seg = build(idx)
+            x, y, moves, tlog, _vals, seg = build(idx)
             if moves is not None:
                 value, policy = model(x, moves)
-                lp, _np = policy_loss(policy, tvals, seg, len(idx))
+                lp, _np = policy_loss(policy, tlog, seg, len(idx))
             else:
                 value, _ = model(x)
                 lp = torch.zeros((), device=device)
@@ -565,6 +655,5 @@ def _train_policy():
     save(CHECKPOINT_OUT)
     say(f"saved {CHECKPOINT_OUT} after {step} optimizer steps ({(time.time() - t0) / 60:.1f} min)")
     return {"model": model, "optimizer": opt, "history": history}
-
 
 policy_training = _train_policy()

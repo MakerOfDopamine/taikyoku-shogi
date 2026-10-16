@@ -4,6 +4,7 @@ material.
     python3 tkn_stats.py selfplay.tkn.tgz            # streams the archive, nothing unpacked
     python3 tkn_stats.py corpus/                     # a directory of shards, or one .tkn
     python3 tkn_stats.py selfplay.tkn --csv stats_   # also write stats_*.csv
+    python3 tkn_stats.py selfplay.tkn.tgz --brief    # only the headline numbers
 
 Everything is read in the frame of the side to move in each recorded position, which is the
 frame the network was given. ``value`` and ``result_stm`` therefore agree in sign when the
@@ -38,6 +39,17 @@ DT = np.dtype([("board", "<u2", (NSQ,)), ("move", "<u4"), ("value", "<f4"),
 assert DT.itemsize == REC, DT.itemsize
 
 
+BRIEF = False
+
+
+def say(text="", key=False):
+    """Print a report line. With --brief, only the key lines, without the section indent."""
+    if not BRIEF:
+        print(text)
+    elif key:
+        print("\n".join(l[4:] if l.startswith("    ") else l for l in text.strip("\n").split("\n")))
+
+
 def bar(frac, width=26, ch="#"):
     frac = 0.0 if frac != frac else max(0.0, min(1.0, frac))
     n = int(round(frac * width))
@@ -50,7 +62,7 @@ def open_streams(path):
         import tarfile
         tf = tarfile.open(path)
         for m in tf.getmembers():
-            if m.isfile():
+            if m.isfile() and m.name.endswith(".tkn"):     # not a .kids beside it
                 yield m.name, tf.extractfile(m)
         return
     paths = sorted(glob.glob(os.path.join(path, "*.tkn"))) if os.path.isdir(path) else [path]
@@ -66,6 +78,9 @@ def read_header(f, name):
         raise SystemExit(f"{name}: not a .tkn shard (magic {raw[:8]!r})")
     u32 = lambda o: struct.unpack_from("<I", raw, o)[0]
     u64 = lambda o: struct.unpack_from("<Q", raw, o)[0]
+    f32 = lambda o: struct.unpack_from("<f", raw, o)[0]
+    if u32(12) > FILE_HDR:                         # version 7 on: 256 bytes, the search
+        raw += f.read(u32(12) - FILE_HDR)
     if u32(20) != REC:
         raise SystemExit(f"{name}: ply record is {u32(20)} bytes, expected {REC}")
     return {"games": u64(40), "plies": u64(48), "mat_shift": u32(28),
@@ -79,7 +94,18 @@ def read_header(f, name):
             "resign_plies": u32(80) >> 24 if u32(8) >= 4 else 0,
             "policy_top": (u32(100) >> 16) / 1000 if u32(8) >= 6 else None,
             "policy_explore": ((u32(100) >> 8) & 0xFF) / 1000 if u32(8) >= 6 else None,
-            "model": raw[104:128].split(b"\x00")[0].decode()}
+            "drop_capped": (u32(100) >> 1) & 1, "endgames": (u32(100) >> 2) & 1,
+            "model": raw[104:128].split(b"\x00")[0].decode(),
+            # version 7 on; sims 0 is the one-ply search
+            "sims": u32(128) if u32(8) >= 7 else 0, "leaves": u32(132) if u32(8) >= 7 else 0,
+            "cpuct": f32(136) if u32(8) >= 7 else 0.0,
+            "noise_frac": f32(140) if u32(8) >= 7 else 0.0,
+            "noise_alpha": f32(144) if u32(8) >= 7 else 0.0,
+            "games_par": u32(148) if u32(8) >= 7 else 1, "opp_sims": u32(152) if u32(8) >= 7 else 0,
+            "contempt": f32(160) if u32(8) >= 7 else 0.0,
+            "contempt_flat": (u32(156) >> 3) & 1 if u32(8) >= 7 else 0,
+            "soft_scale": f32(164) if u32(12) >= 256 else 0.0,
+            "soft_pawns": f32(168) if u32(12) >= 256 else 0.0}
 
 
 def iter_games(f, limit=None):
@@ -116,6 +142,7 @@ def canonical_boards(boards, stm):
 def collect(path, limit=None, hash_boards=True):
     val, res, mat, rem, nleg, nsc, dec = [], [], [], [], [], [], []
     lengths, terms, results = [], [], []
+    g_caps, g_quiet, g_lastcap, g_swing, g_final = [], [], [], [], []
     openings = {n: [] for n in (2, 4, 8)}
     counts = Counter()
     hdr = None
@@ -128,7 +155,18 @@ def collect(path, limit=None, hash_boards=True):
             terms.append(term)
             results.append(result)
             if n_plies == 0:
+                g_caps.append(0); g_quiet.append(0); g_lastcap.append(-1)
+                g_swing.append(np.nan); g_final.append(0.0)
                 continue
+            cap_at = np.nonzero(recs["flags"] & 1)[0]
+            g_caps.append(len(cap_at))
+            g_lastcap.append(int(cap_at[-1]) if len(cap_at) else -1)
+            g_quiet.append(int(np.diff(np.concatenate([[-1], cap_at, [n_plies]])).max()) - 1)
+            m_abs = recs["material"].astype(np.float64) / (1 << shift)   # black minus white
+            g_final.append(float(m_abs[-1]))
+            # the biggest single-ply jump in the winner's favour, from a level start
+            g_swing.append(float(np.diff(np.concatenate([[0.0], result * m_abs])).max())
+                           if result else np.nan)
             side = recs["side"].astype(np.int8)
             stm = 1 - side                                  # side to move in this position
             sign = np.where(stm == 1, 1, -1).astype(np.int8)
@@ -158,6 +196,9 @@ def collect(path, limit=None, hash_boards=True):
         "decided": np.concatenate(dec),
         "lengths": np.array(lengths), "terms": np.array(terms),
         "results": np.array(results), "openings": openings, "counts": counts,
+        "game_captures": np.array(g_caps), "game_quiet": np.array(g_quiet),
+        "game_last_capture": np.array(g_lastcap), "game_swing": np.array(g_swing),
+        "game_final_material": np.array(g_final),
     }
 
 
@@ -172,13 +213,16 @@ def write_csv(prefix, name, header, rows):
 
 def calibration(d, nbins, prefix):
     v, z = d["value"], d["result"]
-    print("\n(a) CALIBRATION -- does a value of v actually mean an outcome of v?\n")
+    say("\n(a) CALIBRATION -- does a value of v actually mean an outcome of v?\n")
     if not np.any(v != 0):
-        print("    the value field is all zeros: this corpus carries no per-ply value.")
+        say("    the value field is all zeros: this corpus carries no per-ply value.")
+        return False
+    if not np.any(z != 0):
+        say("    every game is a draw: nothing to calibrate against.")
         return False
     edges = np.linspace(-1, 1, nbins + 1)
     idx = np.clip(np.digitize(v, edges) - 1, 0, nbins - 1)
-    print("    bin           n      mean v   mean outcome   win%  draw%  loss%   calibration")
+    say("    bin           n      mean v   mean outcome   win%  draw%  loss%   calibration")
     rows = []
     for b in range(nbins):
         m = idx == b
@@ -188,7 +232,7 @@ def calibration(d, nbins, prefix):
         mv, mz = float(v[m].mean()), float(z[m].mean())
         w = float((z[m] == 1).mean()); dr = float((z[m] == 0).mean()); l = float((z[m] == -1).mean())
         # perfect calibration puts mean outcome on the identity line; show the gap
-        print(f"    [{edges[b]:+.2f},{edges[b+1]:+.2f}) {n:8d}  {mv:+7.4f}   {mz:+8.4f}   "
+        say(f"    [{edges[b]:+.2f},{edges[b+1]:+.2f}) {n:8d}  {mv:+7.4f}   {mz:+8.4f}   "
               f"{100*w:5.1f} {100*dr:6.1f} {100*l:6.1f}   {bar((mz+1)/2)}")
         rows.append((f"{edges[b]:.3f}", f"{edges[b+1]:.3f}", n, mv, mz, w, dr, l))
     write_csv(prefix, "calibration", ["lo", "hi", "n", "mean_value", "mean_outcome",
@@ -197,21 +241,34 @@ def calibration(d, nbins, prefix):
     r = float(np.corrcoef(v, zf)[0, 1])
     mse = float(((v - zf) ** 2).mean())
     base = float((zf ** 2).mean())
-    print(f"\n    correlation(value, outcome) = {r:+.4f}   (R2 vs predicting 0: "
+    say(f"\n    correlation(value, outcome) = {r:+.4f}   (R2 vs predicting 0: "
           f"{1 - mse / base:+.4f})")
-    print(f"    mean |value - outcome|      = {np.abs(v - zf).mean():.4f}")
-    print(f"    Brier-style MSE             = {mse:.4f}   (predicting 0 everywhere gives {base:.4f})")
+    say(f"    mean |value - outcome|      = {np.abs(v - zf).mean():.4f}")
+    say(f"    Brier-style MSE             = {mse:.4f}   (predicting 0 everywhere gives {base:.4f})")
 
-    # least squares outcome ~ a + b*v. b < 1 is overconfidence, and 1/b is how much the
-    # value would have to be shrunk to be calibrated.
+    # least squares outcome ~ a + b*v: b < 1 the values are too extreme (overconfident),
+    # b > 1 too timid (underconfident); a is a constant shift.
     b = float(np.cov(v, zf)[0, 1] / v.var())
     a = float(zf.mean() - b * v.mean())
     mse_cal = float(((a + b * v - zf) ** 2).mean())
-    print(f"    least squares: outcome ~ {a:+.4f} {b:+.4f} * value")
-    print(f"      slope {b:.3f} < 1 means overconfident: scaling every value by {b:.3f} would")
-    print(f"      calibrate it and cut MSE to {mse_cal:.4f} ({1 - mse_cal / base:+.4f} R2).")
-    print("    Perfect calibration is the identity: mean outcome should equal mean v in every")
-    print("    row. Mean outcome flatter than mean v means the net is overconfident.")
+    say(f"    least squares: outcome ~ {a:+.4f} {b:+.4f} * value", key=True)
+    if b < 0.95:
+        verdict = (f"slope {b:.3f} < 1: overconfident -- outcomes move less than the values do, "
+                   f"so the values are too extreme")
+    elif b > 1.05:
+        verdict = (f"slope {b:.3f} > 1: underconfident -- outcomes move more than the values do, "
+                   f"so the values are too timid")
+    else:
+        verdict = f"slope {b:.3f}: about right in scale"
+    say(f"      {verdict}.")
+    say(f"      Mapping every value v to {a:+.3f} {b:+.3f} * v would calibrate it and cut MSE to "
+          f"{mse_cal:.4f} ({1 - mse_cal / base:+.4f} R2).")
+    if abs(a) > 0.05:
+        say(f"      The offset {a:+.3f} is a constant shift. At a low sampling temperature it is\n"
+              f"      expected: each recorded value is that of the child the mover picked as best,\n"
+              f"      and the best of many noisy estimates is biased in the mover's favour.")
+    say("    Perfect calibration is the identity: mean outcome should equal mean v in every\n"
+          "    row. Mean outcome flatter than mean v is overconfidence, steeper is underconfidence.")
 
     # does the value head know anything material does not?
     m = d["material"].astype(np.float64)
@@ -219,15 +276,15 @@ def calibration(d, nbins, prefix):
     r_mz = float(np.corrcoef(m, zf)[0, 1])
     denom = np.sqrt((1 - r_vm ** 2) * (1 - r_mz ** 2))
     partial = (r - r_vm * r_mz) / denom if denom > 0 else float("nan")
-    print(f"\n    value vs material:  corr(value, material) = {r_vm:+.4f}")
-    print(f"      corr(value, outcome) {r:+.4f} vs corr(material, outcome) {r_mz:+.4f}")
-    print(f"      partial corr(value, outcome | material) = {partial:+.4f}")
-    print("      That last number is what the value head adds beyond counting material.")
+    say(f"\n    value vs material:  corr(value, material) = {r_vm:+.4f}", key=True)
+    say(f"      corr(value, outcome) {r:+.4f} vs corr(material, outcome) {r_mz:+.4f}", key=True)
+    say(f"      partial corr(value, outcome | material) = {partial:+.4f}", key=True)
+    say("      That last number is what the value head adds beyond counting material.")
     return True
 
 
 def diversity(d, prefix):
-    print("\n(b) DIVERSITY -- distinct opening sequences and repeated positions\n")
+    say("\n(b) DIVERSITY -- distinct opening sequences and repeated positions\n")
     ngames = len(d["lengths"])
     rows = []
     for n in sorted(d["openings"]):
@@ -236,8 +293,8 @@ def diversity(d, prefix):
             continue
         c = Counter(seqs)
         top = c.most_common(1)[0][1]
-        print(f"    first {n} moves: {len(c):6d} distinct of {len(seqs):6d} games "
-              f"({len(c)/len(seqs):6.2%})   most repeated line: {top}x")
+        say(f"    first {n} moves: {len(c):6d} distinct of {len(seqs):6d} games "
+              f"({len(c)/len(seqs):6.2%})   most repeated line: {top}x", key=True)
         rows.append((n, len(c), len(seqs), top))
     write_csv(prefix, "openings", ["n_moves", "distinct", "games", "largest_group"], rows)
 
@@ -247,55 +304,55 @@ def diversity(d, prefix):
         distinct = len(counts)
         dup = total - distinct
         rep = Counter(counts.values())
-        print(f"\n    positions: {total:8d} total, {distinct:8d} distinct, "
+        say(f"\n    positions: {total:8d} total, {distinct:8d} distinct, "
               f"{dup:8d} duplicated ({dup/total:.3%})")
-        print(f"    most repeated position appears {max(counts.values())}x; "
+        say(f"    most repeated position appears {max(counts.values())}x; "
               f"{rep[1]} positions occur exactly once ({rep[1]/distinct:.2%} of distinct)")
-        print("\n    Duplicates are counted in the canonical frame, the one the network sees,")
-        print("    so a position and its colour-mirrored rotation count as the same sample.")
-        print("    HIGH duplication would mean the games keep re-treading the same lines: the")
-        print("    corpus carries less information than its size suggests, the effective")
-        print("    dataset is smaller than the ply count, and training over-weights whatever")
-        print("    those repeated positions happen to teach. LOW duplication means broad")
-        print("    exploration -- but note the flip side: with almost every position seen once,")
-        print("    each one's value target is a single noisy game outcome that never gets")
-        print("    averaged with another visit, so the labels stay high-variance.")
+        say("\n    Duplicates are counted in the canonical frame, the one the network sees,")
+        say("    so a position and its colour-mirrored rotation count as the same sample.")
+        say("    HIGH duplication would mean the games keep re-treading the same lines: the")
+        say("    corpus carries less information than its size suggests, the effective")
+        say("    dataset is smaller than the ply count, and training over-weights whatever")
+        say("    those repeated positions happen to teach. LOW duplication means broad")
+        say("    exploration -- but note the flip side: with almost every position seen once,")
+        say("    each one's value target is a single noisy game outcome that never gets")
+        say("    averaged with another visit, so the labels stay high-variance.")
 
 
 def lengths(d, prefix):
     L = d["lengths"]
-    print("\n(c) GAME LENGTHS\n")
+    say("\n(c) GAME LENGTHS\n")
     edges = [0, 10, 25, 50, 100, 200, 400, 600, 800, 1000, 10 ** 9]
     rows = []
     for lo, hi in zip(edges[:-1], edges[1:]):
         m = (L >= lo) & (L < hi)
         n = int(m.sum())
         label = f"{lo}-{hi-1}" if hi < 10 ** 9 else f"{lo}+"
-        print(f"    {label:>10} plies  {n:6d}  {n/len(L):6.2%}  {bar(n/len(L))}")
+        say(f"    {label:>10} plies  {n:6d}  {n/len(L):6.2%}  {bar(n/len(L))}")
         rows.append((label, n, n / len(L)))
     write_csv(prefix, "lengths", ["bucket", "games", "fraction"], rows)
     q = np.percentile(L, [50, 90, 99])
-    print(f"\n    {len(L)} games: mean {L.mean():.1f}  median {q[0]:.0f}  "
-          f"p90 {q[1]:.0f}  p99 {q[2]:.0f}  max {L.max()}")
+    say(f"\n    {len(L)} games: mean {L.mean():.1f}  median {q[0]:.0f}  "
+          f"p90 {q[1]:.0f}  p99 {q[2]:.0f}  max {L.max()}", key=True)
     tc = Counter(int(t) for t in d["terms"])
-    print("    terminations: " + ", ".join(
-        f"{TERM_NAMES[t]} {c} ({c/len(L):.1%})" for t, c in tc.most_common()))
+    say("    terminations: " + ", ".join(
+        f"{TERM_NAMES[t]} {c} ({c/len(L):.1%})" for t, c in tc.most_common()), key=True)
     rc = Counter(int(r) for r in d["results"])
-    print(f"    results: black {rc.get(1,0)} white {rc.get(-1,0)} draw {rc.get(0,0)}")
+    say(f"    results: black {rc.get(1,0)} white {rc.get(-1,0)} draw {rc.get(0,0)}", key=True)
 
 
 def sign_accuracy(d, prefix):
     v, z, rem = d["value"], d["result"], d["remaining"]
-    print("\n(d) SIGN ACCURACY vs distance from the end of the game\n")
+    say("\n(d) SIGN ACCURACY vs distance from the end of the game\n")
     keep = (z != 0) & (v != 0)
     if not keep.any():
-        print("    no decided positions with a non-zero value")
+        say("    no decided positions with a non-zero value")
         return
     v, z, rem = v[keep], z[keep], rem[keep]
     correct = np.sign(v) == np.sign(z)
     edges = [0, 2, 4, 8, 16, 32, 64, 128, 256, 512, 10 ** 9]
     rows = []
-    print("    plies from end        n    accuracy   mean |v|   ")
+    say("    plies from end        n    accuracy   mean |v|   ")
     for lo, hi in zip(edges[:-1], edges[1:]):
         m = (rem >= lo) & (rem < hi)
         n = int(m.sum())
@@ -303,20 +360,21 @@ def sign_accuracy(d, prefix):
             continue
         acc = float(correct[m].mean())
         label = f"{lo}-{hi-1}" if hi < 10 ** 9 else f"{lo}+"
-        print(f"    {label:>14} {n:9d}    {acc:6.2%}     {np.abs(v[m]).mean():.4f}   "
+        say(f"    {label:>14} {n:9d}    {acc:6.2%}     {np.abs(v[m]).mean():.4f}   "
               f"{bar((acc-0.5)*2)}")
         rows.append((label, n, acc, float(np.abs(v[m]).mean())))
     write_csv(prefix, "sign_accuracy", ["bucket", "n", "accuracy", "mean_abs_value"], rows)
-    print(f"\n    overall {correct.mean():.2%} over {correct.size} decided positions. "
-          f"0.5 is chance;\n    the bar shows how far above chance each bucket is.")
+    say(f"\n    overall {correct.mean():.2%} over {correct.size} decided positions. "
+        f"0.5 is chance;", key=True)
+    say("    the bar shows how far above chance each bucket is.")
 
 
 def material(d, prefix, nbuckets=10):
     m, z = d["material"], d["result"]
-    print("\n(e) MATERIAL vs OUTCOME (material is the side to move minus the opponent)\n")
+    say("\n(e) MATERIAL vs OUTCOME (material is the side to move minus the opponent)\n")
     qs = np.quantile(m, np.linspace(0, 1, nbuckets + 1))
     qs[0], qs[-1] = -np.inf, np.inf
-    print("    material (pawns)          n     win%   draw%   loss%   mean outcome")
+    say("    material (pawns)          n     win%   draw%   loss%   mean outcome")
     rows = []
     for lo, hi in zip(qs[:-1], qs[1:]):
         sel = (m >= lo) & (m < hi)
@@ -326,28 +384,92 @@ def material(d, prefix, nbuckets=10):
         w = float((z[sel] == 1).mean()); dr = float((z[sel] == 0).mean())
         l = float((z[sel] == -1).mean()); mo = float(z[sel].mean())
         lab = f"{'-inf' if lo == -np.inf else f'{lo:+.0f}'} .. {'+inf' if hi == np.inf else f'{hi:+.0f}'}"
-        print(f"    {lab:>20} {n:8d}   {100*w:5.1f}  {100*dr:6.1f}  {100*l:6.1f}   "
+        say(f"    {lab:>20} {n:8d}   {100*w:5.1f}  {100*dr:6.1f}  {100*l:6.1f}   "
               f"{mo:+6.3f}  {bar((mo+1)/2)}")
         rows.append((lab, n, w, dr, l, mo))
     write_csv(prefix, "material", ["bucket", "n", "win", "draw", "loss", "mean_outcome"], rows)
     dec = z[m > 0]
-    print(f"\n    with a material surplus ({(m > 0).sum()} positions): "
-          f"{(dec == 1).mean():.2%} win, {(dec == 0).mean():.2%} draw, {(dec == -1).mean():.2%} loss")
+    say(f"\n    with a material surplus ({(m > 0).sum()} positions): "
+          f"{(dec == 1).mean():.2%} win, {(dec == 0).mean():.2%} draw, {(dec == -1).mean():.2%} loss", key=True)
     dec = z[m < 0]
-    print(f"    with a material deficit ({(m < 0).sum()} positions): "
-          f"{(dec == 1).mean():.2%} win, {(dec == 0).mean():.2%} draw, {(dec == -1).mean():.2%} loss")
+    say(f"    with a material deficit ({(m < 0).sum()} positions): "
+          f"{(dec == 1).mean():.2%} win, {(dec == 0).mean():.2%} draw, {(dec == -1).mean():.2%} loss", key=True)
     ok = np.isfinite(m) & np.isfinite(z)
-    print(f"    correlation(material, outcome) = {np.corrcoef(m[ok], z[ok])[0,1]:+.4f}")
+    say(f"    correlation(material, outcome) = {np.corrcoef(m[ok], z[ok])[0,1]:+.4f}", key=True)
+
+
+def endings(d, prefix):
+    """(f) How games end, in the numbers worth comparing from one batch to the next."""
+    L, t, res = d["lengths"], d["terms"], d["results"]
+    h = d["hdr"]
+    names = np.array([TERM_NAMES[k] for k in t])
+    say("\n(f) HOW GAMES END -- compare these from one batch to the next\n")
+    say(f"    {'ended by':>14} {'games':>15} {'positions':>18} {'median length':>14}", key=True)
+    rows = []
+    for name in TERM_NAMES:
+        m = names == name
+        if not m.any():
+            continue
+        g, p = int(m.sum()), int(L[m].sum())
+        say(f"    {name:>14} {g:7d} ({g / len(L):5.1%}) {p:9d} ({p / L.sum():5.1%}) "
+              f"{np.median(L[m]):14.0f}", key=True)
+        rows.append((name, g, g / len(L), p, p / L.sum(), float(np.median(L[m]))))
+    say("    Training sees positions, not games: a game type that is rare but long can still\n"
+          "    supply most of the data, and every position in a game shares its one label.")
+
+    out = {}
+    rz = names == "resignation"
+    if rz.any():
+        q = np.percentile(L[rz], [10, 50, 90])
+        lead = np.abs(d["game_final_material"][rz])
+        sw = d["game_swing"][rz]
+        share = sw / np.maximum(lead, 1e-9)
+        say(f"\n    resignations ({int(rz.sum())}): decided at ply {q[0]:.0f} / {q[1]:.0f} / {q[2]:.0f} "
+              f"(p10 / median / p90); final lead median {np.median(lead):.0f} pawns", key=True)
+        say(f"      biggest single-ply swing to the winner: median {np.nanmedian(sw):.0f} pawns, "
+              f"{np.nanmedian(share):.0%} of the lead it resigned at", key=True)
+        say("      Near 100%: one big event decided the game. Well under: the lead was built\n"
+              "      over many moves. A rising resignation ply with a falling swing share means\n"
+              "      both sides are giving material away less often.")
+        out.update(resign_ply_median=float(q[1]), resign_ply_p10=float(q[0]),
+                   resign_ply_p90=float(q[2]), resign_lead_median=float(np.median(lead)),
+                   resign_swing_median=float(np.nanmedian(sw)),
+                   resign_swing_share=float(np.nanmedian(share)))
+    cz = names == "ply_cap"
+    if cz.any():
+        n = L[cz].astype(np.float64)
+        rate = d["game_captures"][cz] / n * 100
+        draws = int((res[cz] == 0).sum())
+        say(f"\n    ply cap ({int(cz.sum())} games, {cz.mean():.1%}; {L[cz].sum() / L.sum():.1%} of positions): "
+              f"{draws} drawn, {int(cz.sum()) - draws} scored on material", key=True)
+        say(f"      captures per 100 plies: median {np.median(rate):.1f}; longest capture-free "
+              f"stretch: median {np.median(d['game_quiet'][cz]):.0f} plies; last capture at ply "
+              f"median {np.median(d['game_last_capture'][cz]):.0f} of {h['max_plies']}", key=True)
+        say("      Captures continuing to the end: the game was still being played and simply\n"
+              "      stayed level. Long capture-free stretches, or a last capture far from the\n"
+              "      cap: stagnation, where length says nothing good about strength.")
+        out.update(cap_games=float(cz.mean()), cap_positions=float(L[cz].sum() / L.sum()),
+                   cap_draws=draws, cap_captures_per_100=float(np.median(rate)),
+                   cap_quiet_median=float(np.median(d["game_quiet"][cz])),
+                   cap_last_capture_median=float(np.median(d["game_last_capture"][cz])))
+    for name in ("repetition", "stalemate", "no_progress"):
+        k = int((names == name).sum())
+        if k:
+            say(f"\n    {name}: {k} games", key=True)
+        out[name] = k
+    write_csv(prefix, "endings", ["ended_by", "games", "game_share", "positions", "position_share",
+                                  "median_length"], rows)
+    write_csv(prefix, "endings_summary", list(out), [list(out.values())])
 
 
 def adjudication(path, limit=None, leads=(100, 200, 300, 400, 600, 800), holds=(1, 10, 30)):
-    """(f) For each resignation rule -- a lead of M pawns held K plies -- how many games it
+    """(g) For each resignation rule -- a lead of M pawns held K plies -- how many games it
     would end, how early, how often the leader went on to win, and how often the lead was
     later reversed (the other side went M ahead). Reversal is what a resignation threshold
     must avoid; "leader won" is low whenever games are decided by King blunders rather than
     by material. Needs games played to their natural end: a corpus written with
     resignation on stops at the rule in force, so nothing past it can be measured."""
-    print("\n(f) ADJUDICATION -- what a material resignation rule would have done\n")
+    print("\n(g) ADJUDICATION -- what a material resignation rule would have done\n")
     G = []
     for name, f in open_streams(path):
         h = read_header(f, name)
@@ -403,30 +525,48 @@ def main():
     ap.add_argument("--no-hash", action="store_true", help="skip duplicate detection (faster)")
     ap.add_argument("--csv", default="", help="prefix for CSV output")
     ap.add_argument("--adjudication", action="store_true",
-                    help="also (f): how material resignation thresholds would have fared")
+                    help="also (g): how material resignation thresholds would have fared")
+    ap.add_argument("--brief", action="store_true",
+                    help="only the headline numbers, for comparing one batch with the next")
     a = ap.parse_args()
+    global BRIEF
+    BRIEF = a.brief
 
-    d = collect(a.path, a.limit_games, not a.no_hash)
+    d = collect(a.path, a.limit_games, not (a.no_hash or a.brief))
     h = d["hdr"]
-    print(f"{a.path}: {len(d['lengths'])} games, {d['value'].size} plies")
-    print(f"  model {h['model']}  temperature {h['temperature']:g}  max_plies {h['max_plies']}  "
+    say(f"{a.path}: {len(d['lengths'])} games, {d['value'].size} plies", key=True)
+    say(f"  model {h['model']}  temperature {h['temperature']:g}  max_plies {h['max_plies']}  "
           f"regicide {'on' if h['regicide'] else 'off'}  "
-          f"king safety {'on' if h['king_safety'] else 'off'}")
+          f"king safety {'on' if h['king_safety'] else 'off'}", key=True)
     if h["resign_lead"] or h["cap_by_material"]:
-        print(f"  adjudication: {h['resign_lead']}-pawn lead held {h['resign_plies']} plies"
-              f"{', ply cap scored on material, a draw under ' + str(h['cap_draw_margin']) + ' pawns' if h['cap_by_material'] else ''}")
-    if h.get("policy_top") is not None:
-        print(f"  children scored: the policy's top {h['policy_top']:.1%} of the legal moves "
-              f"plus {h['policy_explore']:.1%} at random")
+        say(f"  adjudication: {h['resign_lead']}-pawn lead held {h['resign_plies']} plies"
+              f"{', ply cap scored on material, a draw under ' + str(h['cap_draw_margin']) + ' pawns' if h['cap_by_material'] else ''}", key=True)
+    if h["sims"]:
+        say(f"  search: {h['sims']} simulations a move, {h['leaves']} leaves per call, c_puct "
+            f"{h['cpuct']:g}, root noise {h['noise_frac']:g} at alpha {h['noise_alpha']:g}/moves, "
+            f"{h['games_par']} games in lockstep, contempt {h['contempt']:g}"
+            f"{' (flat)' if h['contempt_flat'] else ''}", key=True)
+    elif h.get("policy_top") is not None:
+        say(f"  children scored: the policy's top {h['policy_top']:.1%} of the legal moves "
+              f"plus {h['policy_explore']:.1%} at random", key=True)
+    if h["soft_scale"]:
+        say(f"  soft labels: a game cut off by the ply cap or by repetition is labelled "
+            f"{h['soft_scale']:g} * tanh(material / {h['soft_pawns']:g} pawns)", key=True)
+    if h["endgames"]:
+        say("  endgames: random sparse starts with a material lead, only royal captures kept",
+            key=True)
+    if h["drop_capped"]:
+        say("  games that reached the ply cap were dropped: none are in this corpus", key=True)
     frac = d["n_scored"] / np.maximum(d["n_legal"], 1)
-    print(f"  children scored per position: {d['n_scored'].mean():.1f} of "
-          f"{d['n_legal'].mean():.1f} legal ({frac.mean():.1%})")
+    say(f"  network evaluations per position: {d['n_scored'].mean():.1f}, against "
+          f"{d['n_legal'].mean():.1f} legal moves ({frac.mean():.1%})", key=True)
 
     if calibration(d, a.bins, a.csv):
         sign_accuracy(d, a.csv)
     diversity(d, a.csv)
     lengths(d, a.csv)
     material(d, a.csv, a.material_buckets)
+    endings(d, a.csv)
     if a.adjudication:
         adjudication(a.path, a.limit_games)
     if a.csv:

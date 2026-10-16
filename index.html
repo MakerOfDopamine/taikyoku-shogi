@@ -16,7 +16,7 @@
         .cell {
             width: 26px;
             height: 23px;
-            background: #d4b855;
+            background: #998438;
             border: none;
             text-align: center;
             font-size: 12px;
@@ -24,17 +24,29 @@
         }
         .section {
             display: inline-block;
-            border: 3px solid black;
+            border: 4px solid rgb(194, 186, 186);
+            border-radius: 8px;
             padding: 10px;
-            padding-top: 3px
+        }
+
+        button {
+            font: inherit;
         }
     </style>
 </head>
-<body>
+<body style="background-color: white; font-family: 'Courier New', Courier, monospace;">
     <div id="main-container" style="display: flex; flex-direction: row; gap: 16px">
-        <div id="side-panel-left" style="flex: 1; min-width: 0;"></div>
+        <div id="side-panel-left" style="flex: 2; min-width: 0; border: 4px solid black; border-radius: 8px; padding: 16px; display: flex; flex-direction: column;">
+            <div id="game-info-panel" class="section">
+                <p id="move"></p>
+                <p id="stm"></p>
+            </div>
+            <div id="game-option-select" style="display: flex; margin-top: auto;">
+                <button onclick="restart_game()" style="width: 100%; height: 40px; border-radius: 5px; border: none; background-color: #e4b476;">Restart Game</button>
+            </div>
+        </div>
         <div id="grid" style="flex: 0 0 500px"></div>
-        <div id="side-panel" style="flex: 2; min-width: 0;">
+        <div id="side-panel" style="flex: 3; min-width: 0; border: 4px solid black; border-radius: 8px; padding: 16px; display: flex; flex-direction: column;">
             <div id="inspector" class="section">
                 <h3 style="white-space: nowrap; margin-top: 5px; margin-bottom: 5px;">Piece Information</h3>
                 <div id="piece-info"></div>
@@ -44,16 +56,21 @@
             <div id="lookup" class="section">
                 <form id="lookup-form">
                     <input type="text" id="piece-id-lookup"><br>
-                    <button type="submit">Find Piece</button>
+                    <button type="submit" style="padding-top: 3px;">Find Piece</button>
                 </form>
             </div><br><br>
-            <button id="testing">
+            <button id="testing" onclick="alert('hi!')">
                 Hello!
             </button>
+            <input type="file" id="gamefile-upload" accept=".tkn">
         </div>
     </div>
-    <script src="game.js"></script>
-    <script src="grid.js"></script>
+    
+    <!-- Importing javascripts -->
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <script src="engine.js" defer></script>
+    <script src="game.js" defer></script>
+    <script src="grid.js" defer></script>
     
 </body>
 </html>

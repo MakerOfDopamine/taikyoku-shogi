@@ -11,7 +11,8 @@ def _variance_sweep():
     BRANCHES = 4              # playouts per snapshot
     POINTS_PER_GAME = 8       # snapshot stride = mean game length / this
     MAX_PLIES = 1000
-    POLICY_TOP = 0.05           # the value head scores the policy's top this much of the moves
+    POLICY_TOP = 0.05           # fixed in nnplay's one-ply search now; kept in the directory
+                                # names so chunks finished before the change still match
     EXTRA = ["--sub-batch", "32"]
     JOBS = 1                  # nnplay processes at once; >1 only helps an idle GPU
     LENGTH_GAMES = 40         # play games to measure lengths when sweep/<tag>.tkn is missing
@@ -31,7 +32,8 @@ def _variance_sweep():
     # Chunks are taken round-robin across schedules, so every schedule has about the same
     # number of games whenever the session stops. Re-run the cell to continue. Finished
     # chunks live in sweep/variance_<tag>_K<branches>_m<max plies>_p<policy top>/; changing
-    # BRANCHES, MAX_PLIES or POLICY_TOP starts a separate set rather than mixing.
+    # BRANCHES or MAX_PLIES starts a separate set rather than mixing. variance plays the
+    # one-ply search, so the game lengths are measured with play --sims 0 to match.
 
     import glob, os, re, struct, subprocess, time
     import numpy as np
@@ -64,6 +66,7 @@ def _variance_sweep():
             h = f.read(FILE_HDR)
             if len(h) != FILE_HDR or h[:8] != b"TKYNNSP\x00":
                 raise RuntimeError(f"{path}: not a .tkn shard")
+            h += f.read(struct.unpack_from("<I", h, 12)[0] - FILE_HDR)   # 256 from version 7
             if struct.unpack_from("<I", h, 20)[0] != REC:
                 raise RuntimeError(f"{path}: unexpected ply record size")
             cap = struct.unpack_from("<I", h, 64)[0]
@@ -108,7 +111,7 @@ def _variance_sweep():
         shard = os.path.join(out, f"{tag}.tkn")
         if not os.path.exists(shard) and MODE == "run":
             cmd = [nnplay, "play", "--games", str(LENGTH_GAMES), *sched_args(*s),
-                   "--max-plies", str(MAX_PLIES), "--policy-top", str(POLICY_TOP),
+                   "--max-plies", str(MAX_PLIES), "--sims", "0",
                    "--quiet", "--out", shard] + EXTRA
             print(f"[{stamp()}] {tag}: measuring game length: {' '.join(cmd)}", flush=True)
             r = subprocess.run(cmd, capture_output=True, text=True, cwd=work)
@@ -189,7 +192,7 @@ def _variance_sweep():
                     cmd = [nnplay, "variance", "--games", str(n), "--first-game", str(first),
                            *sched_args(*p["sched"]), "--branch-every", str(p["stride"]),
                            "--branches", str(BRANCHES), "--max-plies", str(MAX_PLIES),
-                           "--policy-top", str(POLICY_TOP), "--csv", part] + EXTRA
+                           "--csv", part] + EXTRA
                     print(f"[{stamp()}] {p['tag']}: games {first}-{first + n - 1}", flush=True)
                     with open(log, "w") as lf:
                         pr = subprocess.Popen(cmd, stdout=lf, stderr=subprocess.STDOUT, cwd=work)

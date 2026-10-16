@@ -39,13 +39,15 @@ import time
 
 MAGIC = b"TKYNNSP\x00"
 MOVE_OFF = 1296 * 2                      # the u32 move follows the board in each ply record
-FILE_HDR, GAME_HDR = 128, 16
+FILE_HDR, GAME_HDR = 128, 16             # the header is 256 bytes from version 7 on
+OUT_HDR = 256
 REC = 1296 * 2 + 16
 _CLEANUP: list[str] = []          # half-written outputs to remove if the merge fails
 
 
 def header_fields(raw: bytes) -> dict:
     u32 = lambda o: struct.unpack_from("<I", raw, o)[0]
+    f32 = lambda o: struct.unpack_from("<f", raw, o)[0]
     ver = u32(8)
     rules = u32(80)
     f = {"version": ver, "value_fp": u32(24), "mat_shift": u32(28),
@@ -62,17 +64,40 @@ def header_fields(raw: bytes) -> dict:
          "sub_batch": u32(96), "fp16": u32(100) & 1,
          "policy_top": (u32(100) >> 16) / 1000 if ver >= 6 else None,
          "policy_explore": ((u32(100) >> 8) & 0xFF) / 1000 if ver >= 6 else None,
+         "drop_capped": (u32(100) >> 1) & 1, "endgames": (u32(100) >> 2) & 1,
+         "sims": u32(128) if ver >= 7 else 0, "leaves": u32(132) if ver >= 7 else 0,
+         "cpuct": round(f32(136), 4) if ver >= 7 else 0.0,
+         "noise_frac": round(f32(140), 4) if ver >= 7 else 0.0,
+         "noise_alpha": round(f32(144), 4) if ver >= 7 else 0.0,
+         "games_par": u32(148) if ver >= 7 else 1, "opp_sims": u32(152) if ver >= 7 else 0,
+         "contempt": round(f32(160), 4) if ver >= 7 else 0.0,
+         "contempt_flat": (u32(156) >> 3) & 1 if ver >= 7 else 0,
+         "soft_scale": round(f32(164), 4) if len(raw) >= 256 else 0.0,
          "model": raw[104:128].split(b"\x00")[0].decode(errors="replace")}
     return f
+
+
+def soft_hard(gh):
+    """A game from a file without soft labels: its label (bytes 6..7, 1/10000) is the result."""
+    return gh[:6] + struct.pack("<h", struct.unpack_from("<b", gh, 4)[0] * 10000) + gh[8:]
+
+
+def soft_header(hdr, headers):
+    """The first soft-labelled input's scale and pawns, so a mixed merge keeps them; every
+    other input's games were given their result as the label on the way in."""
+    for raw in headers:
+        if len(raw) >= 256 and struct.unpack_from("<f", raw, 164)[0] > 0:
+            hdr[164:172] = raw[164:172]
+            return
 
 
 def check_header(raw: bytes, name: str) -> None:
     if len(raw) != FILE_HDR or raw[:8] != MAGIC:
         raise SystemExit(f"{name}: not an nnplay .tkn file (magic {raw[:8]!r})")
     sizes = struct.unpack_from("<III", raw, 12)
-    if sizes != (FILE_HDR, GAME_HDR, REC):
+    if sizes[0] not in (FILE_HDR, OUT_HDR) or sizes[1:] != (GAME_HDR, REC):
         raise SystemExit(f"{name}: header/game/ply sizes {sizes}, expected "
-                         f"{(FILE_HDR, GAME_HDR, REC)}")
+                         f"({FILE_HDR} or {OUT_HDR}, {GAME_HDR}, {REC})")
 
 
 def streams(path: str):
@@ -173,11 +198,12 @@ def main():
     t0 = time.time()
 
     with open(tmp_tkn, "wb") as w:
-        w.write(b"\x00" * FILE_HDR)                        # patched once the totals are known
+        w.write(b"\x00" * OUT_HDR)                         # patched once the totals are known
         for path in a.inputs:
             for name, f in streams(path):
                 raw = read_exact(f, FILE_HDR)
                 check_header(raw, name)
+                raw += read_exact(f, struct.unpack_from("<I", raw, 12)[0] - FILE_HDR)
                 fields = header_fields(raw)
                 headers.append(raw)
                 idx = len(headers)
@@ -207,6 +233,8 @@ def main():
                         truncated += 1               # the session died mid-game
                         break
                     seed = struct.unpack_from("<Q", gh, 8)[0]
+                    if not fields["soft_scale"]:
+                        gh = soft_hard(gh)
                     if not a.keep_duplicates:
                         h = hashlib.blake2b(gh, digest_size=16)
                         # the moves alone, so GPU noise in the stored values cannot make one
@@ -245,7 +273,11 @@ def main():
             raise SystemExit("no .tkn data in the inputs")
         if not 1 <= a.header_from <= len(headers):
             raise SystemExit(f"--header-from {a.header_from}: there are {len(headers)} inputs")
-        hdr = bytearray(headers[a.header_from - 1])
+        # always 256 bytes: an older header is padded, and readers gate the new fields on
+        # the version, so they read the padding as nothing
+        hdr = bytearray(headers[a.header_from - 1].ljust(OUT_HDR, b"\x00"))
+        struct.pack_into("<I", hdr, 12, OUT_HDR)
+        soft_header(hdr, headers)
         struct.pack_into("<Q", hdr, 40, tot_games)
         struct.pack_into("<Q", hdr, 48, tot_plies)
         w.seek(0)

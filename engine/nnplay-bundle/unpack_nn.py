@@ -75,6 +75,19 @@ class Header:
     resign_plies: int = 0     # ... held this many plies ended the game
     policy_top: float | None = None      # version 6 on: the value head scored the policy's top
     policy_explore: float | None = None  # this much of the moves, plus this much at random
+    drop_capped: int = 0      # games that reached the ply cap were not written
+    endgames: int = 0         # random sparse starts; only royal captures were written
+    sims: int = 0             # version 7 on: simulations a move, 0 the one-ply search
+    leaves: int = 0           # ... leaves per tree per network call
+    cpuct: float = 0.0
+    noise_frac: float = 0.0   # root Dirichlet noise, alpha = noise_alpha / legal moves
+    noise_alpha: float = 0.0
+    games_par: int = 1        # games in lockstep
+    opp_sims: int = 0         # elo: the opponent's simulations
+    contempt: float = 0.0     # a draw cost the searching side up to this much
+    contempt_flat: int = 0    # ... always that much (play), not scaled by the root's value
+    soft_scale: float = 0.0   # play --selfplay-soft-target-scale: a capped or repeated game's
+    soft_pawns: float = 0.0   # label is soft_scale * tanh(material / soft_pawns)
 
 
 @dataclass
@@ -94,6 +107,8 @@ class NNInfo:
     material: float          # pawns, black minus white (side to move minus opponent if canonical)
     result: int              # 1 the side to move won, -1 lost, 0 draw (absolute: 1 = black)
     result_black: int        # always absolute: 1 black won, -1 white won, 0 draw
+    label_black: float       # the training label, black's view: result_black, or the soft
+                             # material label of a capped or repeated game
     termination: str
     forced_king_capture: bool
     king_safety_override: bool   # the rule changed the pick on this ply
@@ -134,8 +149,11 @@ def read_header(f) -> Header:
         raise ValueError(f"not a .tkn shard (magic {raw[:8]!r})")
     u32 = lambda o: struct.unpack_from("<I", raw, o)[0]
     u64 = lambda o: struct.unpack_from("<Q", raw, o)[0]
-    if u32(12) != FILE_HDR or u32(16) != GAME_HDR or u32(20) != REC:
+    f32 = lambda o: struct.unpack_from("<f", raw, o)[0]
+    if u32(12) not in (FILE_HDR, 256) or u32(16) != GAME_HDR or u32(20) != REC:
         raise ValueError(f"unexpected record sizes {u32(12)}/{u32(16)}/{u32(20)}")
+    raw += f.read(u32(12) - FILE_HDR)              # version 7 on: 256 bytes, the search
+    v7 = u32(8) >= 7
     return Header(version=u32(8), seed_base=u64(32), games=u64(40), plies=u64(48),
                   temperature=struct.unpack_from("<d", raw, 56)[0],
                   max_plies=u32(64), rep_limit=u32(68), no_progress_limit=u32(72),
@@ -149,11 +167,19 @@ def read_header(f) -> Header:
                   piece_types=u32(88), sub_batch=u32(96), fp16=u32(100) & 1,
                   policy_top=(u32(100) >> 16) / 1000 if u32(8) >= 6 else None,
                   policy_explore=((u32(100) >> 8) & 0xFF) / 1000 if u32(8) >= 6 else None,
+                  drop_capped=(u32(100) >> 1) & 1, endgames=(u32(100) >> 2) & 1,
                   opening_plies=struct.unpack_from("<H", raw, 92)[0] if u32(8) >= 2 else 0,
                   opening_temperature=(struct.unpack_from("<H", raw, 94)[0] / 1000.0
                                        if u32(8) >= 2 else None),
                   model=raw[104:128].split(b"\x00")[0].decode(), mat_shift=u32(28),
-                  value_fp=u32(24))
+                  value_fp=u32(24),
+                  sims=u32(128) if v7 else 0, leaves=u32(132) if v7 else 0,
+                  cpuct=f32(136) if v7 else 0.0, noise_frac=f32(140) if v7 else 0.0,
+                  noise_alpha=f32(144) if v7 else 0.0, games_par=u32(148) if v7 else 1,
+                  opp_sims=u32(152) if v7 else 0, contempt=f32(160) if v7 else 0.0,
+                  contempt_flat=(u32(156) >> 3) & 1 if v7 else 0,
+                  soft_scale=f32(164) if len(raw) >= 256 else 0.0,
+                  soft_pawns=f32(168) if len(raw) >= 256 else 0.0)
 
 
 def shard_paths(path: str) -> list[str]:
@@ -200,6 +226,8 @@ def unpack_nn(path: str, canonical: bool = True, terminal_only: bool = False,
                     break
                 n_plies, result, term = struct.unpack_from("<IbB", gh, 0)
                 seed = struct.unpack_from("<Q", gh, 8)[0]
+                label = (struct.unpack_from("<h", gh, 6)[0] / 10000 if hdr.soft_scale > 0
+                         else float(result))
                 raw = f.read(n_plies * REC)
                 if len(raw) < n_plies * REC:
                     raise ValueError(f"{p}: game {gi} truncated")
@@ -213,10 +241,12 @@ def unpack_nn(path: str, canonical: bool = True, terminal_only: bool = False,
                         side=int(r["side"]), side_black=int(r["side"]),
                         move={k: unpack_move(int(r["move"]))[k] for k in ("special", "origin", "target")},
                         value=float(r["value"]), n_legal=int(r["n_legal"]),
-                        # 0 was the reserved pad in files written before --subset-fraction
-                        n_scored=int(r["n_scored"]) or int(r["n_legal"]),
+                        # 0 was the reserved pad before version 2, meaning every child;
+                        # from version 7 a forced King capture really costs none
+                        n_scored=int(r["n_scored"]) if hdr.version >= 7
+                                 else int(r["n_scored"]) or int(r["n_legal"]),
                         material=float(r["material"]) / (1 << hdr.mat_shift),
-                        result=int(result), result_black=int(result),
+                        result=int(result), result_black=int(result), label_black=label,
                         termination=TERM_NAMES[term],
                         forced_king_capture=bool(r["flags"] & PF_FORCED_KING),
                         king_safety_override=bool(r["flags"] & PF_KING_SAFETY),

@@ -8,7 +8,7 @@ const NONE = [0,0,0,0,0,0,0,0]
 const Q = [99,99,99,99,99,99,99,99]
 
 class Board {
-    constructor(base_board = null) {
+    constructor(base_board = null, turn = 1) {
         this.board = [
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -47,12 +47,15 @@ class Board {
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
         ]
+        this.turn = turn
+        this.turn_no = 1
         if (base_board != null) {
             // Deep copy: never alias the caller's array. Coordinates are re-derived
             // from the actual position so a hand-built board can't disagree with itself.
-            this.board = base_board.map((row, i) => row.map(
+            this.board = base_board.board.map((row, i) => row.map(
                 (piece, j) => (piece === 0 ? PIECES[0] : piece).copy(i, j)
             ))
+            this.turn = base_board.turn
         } else {
             this.initiate()
         }
@@ -502,6 +505,10 @@ class Board {
         let special = Math.floor(move / 1296)
         let target_x = Math.floor(move / 36) % 36
         let target_y = move % 36
+
+        if (this.turn != this.board[start_x][start_y].color) {
+            return
+        }
         if (move < 1296) {
             // Regular moves.
             this.board[target_x][target_y] = this.board[start_x][start_y].copy(target_x, target_y)
@@ -519,7 +526,11 @@ class Board {
                 return
             }
             this.move(start_x, start_y, mid_x * 36 + mid_y, true)
+            this.turn = 1 - this.turn
+            this.turn_no -= 1
             this.move(mid_x, mid_y, target_x * 36 + target_y, true)
+            this.turn = 1 - this.turn
+            this.turn_no -= 1
         } else if (move < 10 * 1296) {
             // "Trample" moves: remove all intermediate pieces. Note that this can include friendly pieces!!
             let dx = target_x - start_x
@@ -546,6 +557,9 @@ class Board {
         if (!no_promote && ((this.board[target_x][target_y].color == 1 && target_x >= 25) || (this.board[target_x][target_y].color == 0 && target_x <= 10))) {
             this.promote(target_x, target_y)
         }
+
+        this.turn = 1 - this.turn
+        this.turn_no += 1
     }
 
     promote(x, y) {
@@ -2348,3 +2362,12 @@ const VALUES_PROMOTED = {
 const material_value = (piece) => (piece.promoted && VALUES_PROMOTED[piece.id] !== undefined)
     ? VALUES_PROMOTED[piece.id]
     : VALUES[piece.id]
+
+document.getElementById("gamefile-upload").addEventListener("change", async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+
+    const text = await file.text();
+    console.log(text); // do whatever with it
+});
+

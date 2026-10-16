@@ -17,9 +17,9 @@ let board = global_game.board // for ONCE the js laziness of only assigning refe
 
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
 
-const COLOR_EMPTY = "#d4b855"    // board background
+const COLOR_EMPTY = "#c2a84c"    // board background
 const COLOR_SELECTED = "#0eac62" // selected square
-const COLOR_MOVE = "#888888"     // ordinary move (special 0)
+const COLOR_MOVE = "#c2c2c2"     // ordinary move (special 0)
 const COLOR_INF_MOVE = "#ff3300" // display board only
 const COLOR_TRAMPLE = "#905c4c"  // trample move (special 9, SHIFT)
 const COLOR_FIRST = "#6b3fa0"    // medium move, first leg (special 1-8, X)
@@ -33,6 +33,7 @@ let selected = [null, null]
 let intermediate = null
 let SHIFT = false
 let X_HELD = false
+let turn = 1
 
 function cell(x, y) {
     return document.getElementById(`cell-${x}-${y}`)
@@ -40,7 +41,7 @@ function cell(x, y) {
 
 function piece_color(piece) {
     return piece.promoted
-        ? (piece.color == 0 ? "#00aaff" : "#ff0000")
+        ? (piece.color == 0 ? "#aaff00" : "#ff0000")
         : (piece.color == 0 ? "#ffffff" : "#000000")
 }
 
@@ -82,8 +83,6 @@ function first_leg_directions(moves) {
 
 // Ordinary moves.
 function render() {
-    clear()
-    draw_pieces()
     for (let square of selected_moves()) {
         if (square >= 1296) continue
         cell(Math.floor(square / 36), square % 36).style.background = COLOR_MOVE
@@ -92,8 +91,6 @@ function render() {
 
 // SHIFT: trample moves.
 function render_special() {
-    clear()
-    draw_pieces()
     for (let square of selected_moves()) {
         if (square < 9 * 1296) continue
         cell(Math.floor(square / 36) % 36, square % 36).style.background = COLOR_TRAMPLE
@@ -102,8 +99,6 @@ function render_special() {
 
 // X, stage one: the intermediate squares a medium move may step through.
 function render_medium() {
-    clear()
-    draw_pieces()
     if (selected[0] == null) return
     for (let special of first_leg_directions(selected_moves())) {
         let dir = DIRS[special - 1]
@@ -118,8 +113,6 @@ function render_medium() {
 // intermediate square, showing the second-leg destinations from there.
 // This only draws, the real board is untouched until the move is committed.
 function render_intermediate() {
-    clear()
-    draw_pieces()
     if (selected[0] == null || intermediate == null) return
 
     let piece = board.board[selected[0]][selected[1]]
@@ -161,9 +154,9 @@ function _get_grid_sizing_max(piece) {
 
 function update_ui() {
     display_grid.innerHTML = ""
-    let piece = board.getPiece(selected[0], selected[1])
+    let piece = PIECES[board.getPiece(selected[0], selected[1])?.id]
     let display = 'inline-grid'
-    if (piece === null || piece.is_empty()) {
+    if (piece === null || piece === undefined || piece.is_empty()) {
         display_grid.style.display = 'none'
         return
     }
@@ -218,7 +211,6 @@ function update_ui() {
         }
 
         for (let dest of piece.tp) {
-            console.log(dest[2])
             document.getElementById(`display-cell-[${dest[0]},${dest[1]}]`).style.background = "#e9d946"
             document.getElementById(`display-cell-[${dest[0]},${dest[1]}]`).innerHTML = star
             for (let j in dest[2]) {
@@ -259,6 +251,9 @@ function update_ui() {
 
 // Draw whatever the current modifier state is.
 function refresh() {
+    clear()
+    draw_pieces()
+
     if (X_HELD && intermediate != null) {
         render_intermediate()
     } else if (X_HELD) {
@@ -270,6 +265,7 @@ function refresh() {
     }
 
     update_ui()
+    if (selected[0] !== null) document.getElementById(`cell-${selected[0]}-${selected[1]}`).style.background = COLOR_SELECTED
 }
 
 function click(x, y) {
@@ -277,7 +273,6 @@ function click(x, y) {
         selected = [x, y]
         intermediate = null
         refresh()
-        document.getElementById(`cell-${x}-${y}`).style.background = COLOR_SELECTED
         return
     }
 
@@ -323,8 +318,6 @@ function click(x, y) {
         click(x, y)
         return
     }
-
-    document.getElementById(`cell-${x}-${y}`).style.background = COLOR_SELECTED
 }
 
 function lookup_piece(x) {
@@ -350,6 +343,26 @@ function lookup_piece(x) {
     }
 }
 
+function flip_perspective() {
+    let board_grid = []
+    for (let i = 0; i < 36; i++) {
+        for (let j = 0; j < 36; j++) {
+            board_grid.push(document.getElementById(`cell-${i}-${j}`))
+        }
+    }
+    for (let el of board_grid) {
+        let nel = el.cloneNode(true)
+        let pos = el.id.split("-")
+        nel.id = `cell-${reverse(Number(pos[1]))}-${reverse(Number(pos[2]))}`
+        nel.dataset.row = reverse(Number(pos[1]))
+        nel.dataset.col = reverse(Number(pos[2]))
+        nel.addEventListener('click', () => {click(reverse(Number(pos[1])), reverse(Number(pos[2])))})
+        el.parentNode.replaceChild(nel, el)
+    }
+    refresh()
+    return
+}
+
 for (let i = 0; i < 36; i++) {
     for (let j = 0; j < 36; j++) {
         cell(i, j).addEventListener('click', () => {click(i, j)})
@@ -366,6 +379,8 @@ window.addEventListener('keydown', (event) => {
         X_HELD = true
         intermediate = null
         refresh()
+    } else if ((event.code === 'KeyF' || event.key === 'f' || event.key === 'F') && event.altKey) {
+        flip_perspective()
     }
 });
 
@@ -392,5 +407,11 @@ document.getElementById("lookup-form").addEventListener("submit", (e) => {
     lookup_piece(document.getElementById('piece-id-lookup').value)
 });
 
-render()
-
+refresh()
+const gameLoop = setInterval(() => {
+    if (board.turn != 1) {
+        get_engine_move()
+    }
+    document.getElementById("move").innerHTML = `It is move ${board.turn_no}.`
+    document.getElementById("stm").innerHTML = `It is ${board.turn ? "black" : "white"}'s turn to move.`
+}, 100)

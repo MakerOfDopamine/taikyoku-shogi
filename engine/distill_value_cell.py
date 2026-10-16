@@ -91,7 +91,7 @@ def _distill_value():
                 continue
             fi = len(maps)
             maps.append(mm)
-            p = 128
+            p = struct.unpack_from("<I", mm, 12)[0]      # the header: 128 bytes, 256 from v7
             while p + 16 <= len(mm):
                 n = struct.unpack_from("<I", mm, p)[0]
                 if p + 16 + n * REC > len(mm):

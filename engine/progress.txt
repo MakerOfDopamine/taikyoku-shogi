@@ -67,3 +67,290 @@ Generation 1         : b3118b47
 
 Generation 2         : b0414eb0
 
+-----------------------------
+Gen 1:
+least squares: outcome ~ +0.1287 +1.2490 * value
+value vs material:  corr(value, material) = +0.6674
+corr(value, outcome) +0.3768 vs corr(material, outcome) +0.5675
+partial corr(value, outcome | material) = -0.0031
+sign accuracy: overall 67.35% over 829098 decided positions. 0.5 is chance;
+first 2 moves:   2295 distinct of   5471 games (41.95%)   most repeated line: 65x
+5471 games: mean 182.8  median 83  p90 500  p99 500  max 500
+terminations: resignation 4162 (76.1%), ply_cap 1269 (23.2%), royal_capture 40 (0.7%)
+results: black 2692 white 2437 draw 342
+with a material surplus (489259 positions): 65.55% win, 17.13% draw, 17.32% loss
+with a material deficit (509868 positions): 18.50% win, 17.07% draw, 64.43% loss
+correlation(material, outcome) = +0.5675
+          ended by           games          positions  median length
+     royal_capture      40 ( 0.7%)     11433 ( 1.1%)            302
+           ply_cap    1269 (23.2%)    634500 (63.4%)            500
+       resignation    4162 (76.1%)    354165 (35.4%)             60
+
+resignations (4162): decided at ply 28 / 60 / 174 (p10 / median / p90); final lead median 376 pawns
+biggest single-ply swing to the winner: median 167 pawns, 44% of the lead it resigned at
+ply cap (1269 games, 23.2%; 63.4% of positions): 342 drawn, 927 scored on material
+captures per 100 plies: median 27.8; longest capture-free stretch: median 41 plies; last capture at ply median 490 of 500
+
+Gen 2:
+least squares: outcome ~ +0.1351 +1.8274 * value
+value vs material:  corr(value, material) = +0.8159
+corr(value, outcome) +0.6041 vs corr(material, outcome) +0.7204
+partial corr(value, outcome | material) = +0.0408
+sign accuracy: overall 78.82% over 827613 decided positions. 0.5 is chance;
+first 2 moves:   1780 distinct of   3913 games (45.49%)   most repeated line: 22x
+3913 games: mean 255.6  median 131  p90 500  p99 500  max 500
+terminations: resignation 2323 (59.4%), ply_cap 1581 (40.4%), royal_capture 9 (0.2%)
+results: black 1845 white 1723 draw 345
+with a material surplus (492594 positions): 72.79% win, 17.23% draw, 9.98% loss
+with a material deficit (506721 positions): 10.95% win, 17.25% draw, 71.80% loss
+correlation(material, outcome) = +0.7204
+          ended by           games          positions  median length
+     royal_capture       9 ( 0.2%)       922 ( 0.1%)             55
+           ply_cap    1581 (40.4%)    790500 (79.0%)            500
+       resignation    2323 (59.4%)    208691 (20.9%)             57
+resignations (2323): decided at ply 28 / 57 / 205 (p10 / median / p90); final lead median 379 pawns
+biggest single-ply swing to the winner: median 175 pawns, 45% of the lead it resigned at
+ply cap (1581 games, 40.4%; 79.0% of positions): 345 drawn, 1236 scored on material
+captures per 100 plies: median 20.6; longest capture-free stretch: median 37 plies; last capture at ply median 495 of 500
+
+Gen 3:
+  model net_fp16.onnx@b6544d75  temperature 0.05  max_plies 1000  regicide on  king safety on
+  adjudication: 300-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  children scored: the policy's top 5.0% of the legal moves plus 2.0% at random
+  children scored per position: 59.2 of 838.4 legal (7.1%)
+least squares: outcome ~ +0.1244 +1.9672 * value
+value vs material:  corr(value, material) = +0.8662
+  corr(value, outcome) +0.6522 vs corr(material, outcome) +0.7288
+  partial corr(value, outcome | material) = +0.0610
+overall 81.97% over 808739 decided positions. 0.5 is chance;
+first 2 moves:    809 distinct of   1331 games (60.78%)   most repeated line: 10x
+first 4 moves:   1331 distinct of   1331 games (100.00%)   most repeated line: 1x
+first 8 moves:   1331 distinct of   1331 games (100.00%)   most repeated line: 1x
+1331 games: mean 751.9  median 1000  p90 1000  p99 1000  max 1000
+terminations: ply_cap 842 (63.3%), resignation 489 (36.7%)
+results: black 667 white 472 draw 192
+with a material surplus (498104 positions): 70.81% win, 19.13% draw, 10.06% loss
+with a material deficit (502213 positions): 10.27% win, 19.23% draw, 70.50% loss
+correlation(material, outcome) = +0.7288
+      ended by           games          positions  median length
+       ply_cap     842 (63.3%)    842000 (84.1%)           1000
+   resignation     489 (36.7%)    158739 (15.9%)            219
+resignations (489): decided at ply 25 / 219 / 790 (p10 / median / p90); final lead median 316 pawns
+  biggest single-ply swing to the winner: median 159 pawns, 47% of the lead it resigned at
+ply cap (842 games, 63.3%; 84.1% of positions): 192 drawn, 650 scored on material
+  captures per 100 plies: median 18.0; longest capture-free stretch: median 45 plies; last capture at ply median 995 of 1000
+
+##################
+## SEARCH added ##
+##################
+
+Gen 4:
+  model net_fp16.onnx@55c25e56  temperature 1  max_plies 1000  regicide on  king safety on
+  adjudication: 300-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  search: 128 simulations a move, 8 leaves per call, c_puct 1.25, root noise 0.25 at alpha 10/moves, 32 games in lockstep
+  network evaluations per position: 124.0, against 1036.8 legal moves (13.1%)
+least squares: outcome ~ -0.0040 +1.5826 * value
+value vs material:  corr(value, material) = +0.7311
+  corr(value, outcome) +0.5256 vs corr(material, outcome) +0.7020
+  partial corr(value, outcome | material) = +0.0255
+overall 77.89% over 1505230 decided positions. 0.5 is chance;
+first 2 moves:    635 distinct of   2438 games (26.05%)   most repeated line: 114x
+first 4 moves:   2220 distinct of   2438 games (91.06%)   most repeated line: 7x
+first 8 moves:   2438 distinct of   2438 games (100.00%)   most repeated line: 1x
+2438 games: mean 831.5  median 1000  p90 1000  p99 1000  max 1000
+terminations: ply_cap 1928 (79.1%), resignation 488 (20.0%), royal_capture 22 (0.9%)
+results: black 858 white 1058 draw 522
+with a material surplus (1006818 positions): 64.76% win, 25.66% draw, 9.58% loss
+with a material deficit (1019302 positions): 9.85% win, 25.82% draw, 64.33% loss
+correlation(material, outcome) = +0.7020
+      ended by           games          positions  median length
+ royal_capture      22 ( 0.9%)      9693 ( 0.5%)            466
+       ply_cap    1928 (79.1%)   1928000 (95.1%)           1000
+   resignation     488 (20.0%)     89538 ( 4.4%)             43
+resignations (488): decided at ply 24 / 43 / 720 (p10 / median / p90); final lead median 351 pawns
+  biggest single-ply swing to the winner: median 161 pawns, 42% of the lead it resigned at
+ply cap (1928 games, 79.1%; 95.1% of positions): 522 drawn, 1406 scored on material
+  captures per 100 plies: median 22.5; longest capture-free stretch: median 28 plies; last capture at ply median 996 of 1000
+
+Gen 5:
+  model net_fp16.onnx@6e3082ff  temperature 1  max_plies 1000  regicide on  king safety on
+  adjudication: 300-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  search: 128 simulations a move, 8 leaves per call, c_puct 1.25, root noise 0.25 at alpha 10/moves, 32 games in lockstep
+  network evaluations per position: 118.1, against 888.5 legal moves (14.3%)
+least squares: outcome ~ +0.0288 +1.1136 * value
+value vs material:  corr(value, material) = +0.7013
+  corr(value, outcome) +0.4387 vs corr(material, outcome) +0.6173
+  partial corr(value, outcome | material) = +0.0102
+overall 73.43% over 1543638 decided positions. 0.5 is chance;
+first 2 moves:    976 distinct of   2164 games (45.10%)   most repeated line: 30x
+first 4 moves:   2094 distinct of   2164 games (96.77%)   most repeated line: 9x
+first 8 moves:   2164 distinct of   2164 games (100.00%)   most repeated line: 1x
+2164 games: mean 932.0  median 1000  p90 1000  p99 1000  max 1000
+terminations: ply_cap 1871 (86.5%), resignation 254 (11.7%), royal_capture 35 (1.6%), repetition 4 (0.2%)
+results: black 859 white 830 draw 475
+with a material surplus (999061 positions): 62.07% win, 23.38% draw, 14.55% loss
+with a material deficit (1016491 positions): 14.88% win, 23.53% draw, 61.59% loss
+correlation(material, outcome) = +0.6173
+      ended by           games          positions  median length
+ royal_capture      35 ( 1.6%)     19814 ( 1.0%)            584
+    repetition       4 ( 0.2%)      2136 ( 0.1%)            542
+       ply_cap    1871 (86.5%)   1871000 (92.8%)           1000
+   resignation     254 (11.7%)    123828 ( 6.1%)            488
+resignations (254): decided at ply 33 / 488 / 877 (p10 / median / p90); final lead median 311 pawns
+  biggest single-ply swing to the winner: median 124 pawns, 39% of the lead it resigned at
+ply cap (1871 games, 86.5%; 92.8% of positions): 471 drawn, 1400 scored on material
+  captures per 100 plies: median 33.3; longest capture-free stretch: median 24 plies; last capture at ply median 997 of 1000
+repetition: 4 games
+
+1000 games, 722759 plies (723/game), 91.4 min
+  as black : 218W 104L 178D
+  as white : 215W 104L 181D
+  overall  : 433W 208L 359D   score 0.6125
+  Elo +93, 95% credible interval [+71, +113]   (baseline_fp16.onnx = 0)
+  draw rating 140, first-move advantage +1
+  king safety changed the pick on 9525 plies (1.32%); 2 plies had no safe move at all
+
+Gen 6:
+  model net_fp16.onnx@7b1b1f3c  temperature 1  max_plies 2000  regicide on  king safety on
+  adjudication: 300-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  search: 128 simulations a move, 8 leaves per call, c_puct 1.25, root noise 0.25 at alpha 10/moves, 32 games in lockstep, contempt 0
+  network evaluations per position: 113.9, against 698.0 legal moves (20.1%)
+least squares: outcome ~ +0.0307 +0.9179 * value
+value vs material:  corr(value, material) = +0.7432
+  corr(value, outcome) +0.4703 vs corr(material, outcome) +0.5890
+  partial corr(value, outcome | material) = +0.0603
+overall 76.75% over 1341376 decided positions. 0.5 is chance;
+first 2 moves:    643 distinct of   1280 games (50.23%)   most repeated line: 21x
+first 4 moves:   1260 distinct of   1280 games (98.44%)   most repeated line: 3x
+first 8 moves:   1280 distinct of   1280 games (100.00%)   most repeated line: 1x
+1280 games: mean 1571.3  median 2000  p90 2000  p99 2000  max 2000
+terminations: ply_cap 866 (67.7%), resignation 324 (25.3%), royal_capture 73 (5.7%), repetition 17 (1.3%)
+results: black 467 white 470 draw 343
+with a material surplus (999153 positions): 54.76% win, 33.27% draw, 11.97% loss
+with a material deficit (1010677 positions): 12.19% win, 33.33% draw, 54.48% loss
+correlation(material, outcome) = +0.5890
+      ended by           games          positions  median length
+ royal_capture      73 ( 5.7%)     73260 ( 3.6%)           1121
+    repetition      17 ( 1.3%)     17914 ( 0.9%)           1045
+       ply_cap     866 (67.7%)   1732000 (86.1%)           2000
+   resignation     324 (25.3%)    188117 ( 9.4%)            530
+resignations (324): decided at ply 45 / 530 / 1075 (p10 / median / p90); final lead median 310 pawns
+  biggest single-ply swing to the winner: median 130 pawns, 41% of the lead it resigned at
+ply cap (866 games, 67.7%; 86.1% of positions): 326 drawn, 540 scored on material
+  captures per 100 plies: median 26.5; longest capture-free stretch: median 72 plies; last capture at ply median 1986 of 2000
+repetition: 17 games
+
+==========================================================================================================
+The big dividing wall
+The previous policy had some BAAAAAAD issues with draw-ing (namely)
+so I had to regress all the way back to Gen 3
+==========================================================================================================
+
+NEW Gen 3
+  model net_fp16.onnx@776d104d  temperature 0.5  max_plies 1000  regicide on  king safety on
+  adjudication: 0-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  search: 128 simulations a move, 8 leaves per call, c_puct 1.25, root noise 0.25 at alpha 10/moves, 32 games in lockstep, contempt 0.1
+  soft labels: a game cut off by the ply cap or by repetition is labelled 0.75 * tanh(material / 300 pawns)
+  network evaluations per position: 119.1, against 873.2 legal moves (14.8%)
+least squares: outcome ~ +0.0422 +1.1740 * value
+value vs material:  corr(value, material) = +0.7569
+  corr(value, outcome) +0.5572 vs corr(material, outcome) +0.6607
+  partial corr(value, outcome | material) = +0.1164
+overall 78.20% over 814075 decided positions. 0.5 is chance;
+first 2 moves:    190 distinct of   1026 games (18.52%)   most repeated line: 113x
+first 4 moves:    882 distinct of   1026 games (85.96%)   most repeated line: 11x
+first 8 moves:   1026 distinct of   1026 games (100.00%)   most repeated line: 1x
+1026 games: mean 983.7  median 1000  p90 1000  p99 1000  max 1000
+terminations: ply_cap 980 (95.5%), repetition 30 (2.9%), royal_capture 16 (1.6%)
+results: black 419 white 401 draw 206
+with a material surplus (499857 positions): 66.80% win, 19.25% draw, 13.95% loss
+with a material deficit (508833 positions): 14.33% win, 19.42% draw, 66.25% loss
+correlation(material, outcome) = +0.6607
+      ended by           games          positions  median length
+ royal_capture      16 ( 1.6%)     10076 ( 1.0%)            671
+    repetition      30 ( 2.9%)     19175 ( 1.9%)            728
+       ply_cap     980 (95.5%)    980000 (97.1%)           1000
+ply cap (980 games, 95.5%; 97.1% of positions): 176 drawn, 804 scored on material
+  captures per 100 plies: median 32.5; longest capture-free stretch: median 31 plies; last capture at ply median 996 of 1000
+repetition: 30 games
+
+Gen 4:
+  model net_fp16.onnx@b7b412c7  temperature 0.5  max_plies 1500  regicide on  king safety on
+  adjudication: 0-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  search: 128 simulations a move, 8 leaves per call, c_puct 1.25, root noise 0.25 at alpha 10/moves, 32 games in lockstep, contempt 0.1
+  network evaluations per position: 116.2, against 783.1 legal moves (16.8%)
+least squares: outcome ~ +0.0438 +0.8987 * value
+value vs material:  corr(value, material) = +0.8080
+  corr(value, outcome) +0.4849 vs corr(material, outcome) +0.5853
+  partial corr(value, outcome | material) = +0.0250
+overall 76.65% over 738526 decided positions. 0.5 is chance;
+first 2 moves:    112 distinct of    694 games (16.14%)   most repeated line: 38x
+first 4 moves:    506 distinct of    694 games (72.91%)   most repeated line: 7x
+first 8 moves:    694 distinct of    694 games (100.00%)   most repeated line: 1x
+694 games: mean 1468.6  median 1500  p90 1500  p99 1500  max 1500
+terminations: ply_cap 653 (94.1%), royal_capture 36 (5.2%), repetition 5 (0.7%)
+results: black 265 white 241 draw 188
+with a material surplus (506394 positions): 58.33% win, 27.49% draw, 14.19% loss
+with a material deficit (512511 positions): 14.40% win, 27.58% draw, 58.02% loss
+correlation(material, outcome) = +0.5853
+      ended by           games          positions  median length
+ royal_capture      36 ( 5.2%)     33526 ( 3.3%)           1021
+    repetition       5 ( 0.7%)      6169 ( 0.6%)           1369
+       ply_cap     653 (94.1%)    979500 (96.1%)           1500
+ply cap (653 games, 94.1%; 96.1% of positions): 183 drawn, 470 scored on material
+  captures per 100 plies: median 34.3; longest capture-free stretch: median 40 plies; last capture at ply median 1496 of 1500
+repetition: 5 games
+
+Gen 5:
+  model net_fp16.onnx@cbbabef6  temperature 0.5  max_plies 1500  regicide on  king safety on
+  adjudication: 0-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  search: 128 simulations a move, 8 leaves per call, c_puct 1.25, root noise 0.25 at alpha 10/moves, 32 games in lockstep, contempt 0.1
+  network evaluations per position: 128.0, against 708.6 legal moves (21.5%)
+least squares: outcome ~ +0.0033 +1.2608 * value
+value vs material:  corr(value, material) = +0.9084
+  corr(value, outcome) +0.5190 vs corr(material, outcome) +0.5610
+  partial corr(value, outcome | material) = +0.0272
+overall 77.00% over 686446 decided positions. 0.5 is chance;
+first 2 moves:    114 distinct of    711 games (16.03%)   most repeated line: 37x
+first 4 moves:    588 distinct of    711 games (82.70%)   most repeated line: 6x
+first 8 moves:    711 distinct of    711 games (100.00%)   most repeated line: 1x
+711 games: mean 1420.1  median 1500  p90 1500  p99 1500  max 1500
+terminations: ply_cap 609 (85.7%), royal_capture 90 (12.7%), repetition 12 (1.7%)
+results: black 229 white 263 draw 219
+with a material surplus (500775 positions): 54.62% win, 31.97% draw, 13.42% loss
+with a material deficit (508542 positions): 13.69% win, 32.04% draw, 54.27% loss
+correlation(material, outcome) = +0.5610
+      ended by           games          positions  median length
+ royal_capture      90 (12.7%)     83448 ( 8.3%)            988
+    repetition      12 ( 1.7%)     12728 ( 1.3%)           1116
+       ply_cap     609 (85.7%)    913500 (90.5%)           1500
+ply cap (609 games, 85.7%; 90.5% of positions): 207 drawn, 402 scored on material
+  captures per 100 plies: median 37.1; longest capture-free stretch: median 47 plies; last capture at ply median 1492 of 1500
+repetition: 12 games
+
+Gen 6:
+  model net_fp16.onnx@e28ab1ad  temperature 0.5  max_plies 1500  regicide on  king safety on
+  adjudication: 0-pawn lead held 10 plies, ply cap scored on material, a draw under 50 pawns
+  search: 128 simulations a move, 8 leaves per call, c_puct 1.25, root noise 0.25 at alpha 10/moves, 32 games in lockstep, contempt 0.1
+  network evaluations per position: 128.0, against 650.0 legal moves (23.1%)
+least squares: outcome ~ +0.0030 +1.6198 * value
+value vs material:  corr(value, material) = +0.8992
+  corr(value, outcome) +0.5449 vs corr(material, outcome) +0.5676
+  partial corr(value, outcome | material) = +0.0960
+overall 77.25% over 739898 decided positions. 0.5 is chance;
+first 2 moves:    118 distinct of    775 games (15.23%)   most repeated line: 43x
+first 4 moves:    663 distinct of    775 games (85.55%)   most repeated line: 4x
+first 8 moves:    775 distinct of    775 games (100.00%)   most repeated line: 1x
+775 games: mean 1449.9  median 1500  p90 1500  p99 1500  max 1500
+terminations: ply_cap 714 (92.1%), royal_capture 59 (7.6%), repetition 2 (0.3%)
+results: black 238 white 280 draw 257
+with a material surplus (556361 positions): 52.77% win, 34.08% draw, 13.15% loss
+with a material deficit (566569 positions): 13.45% win, 34.20% draw, 52.36% loss
+correlation(material, outcome) = +0.5676
+      ended by           games          positions  median length
+ royal_capture      59 ( 7.6%)     51399 ( 4.6%)            924
+    repetition       2 ( 0.3%)      1260 ( 0.1%)            630
+       ply_cap     714 (92.1%)   1071000 (95.3%)           1500
+ply cap (714 games, 92.1%; 95.3% of positions): 255 drawn, 459 scored on material
+  captures per 100 plies: median 36.1; longest capture-free stretch: median 71 plies; last capture at ply median 1488 of 1500
+repetition: 2 games
