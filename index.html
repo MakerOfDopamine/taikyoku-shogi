@@ -32,45 +32,170 @@
         button {
             font: inherit;
         }
+
+        .fake-btn {
+            all: unset; 
+            cursor: pointer;
+            transition: all 0.5s ease;
+        }
+
+        .fake-btn:hover {
+            color: #666;
+        }
+
+        #gamefile-upload {
+            display: none;
+        }
+
+        #upload-btn {
+            padding: 6px 16px;
+            border: none;
+            border-radius: 5px;
+            background-color: #e4b476;
+            white-space: nowrap;
+            cursor: pointer;
+        }
+
+        #viewer-moves-container {
+            display: flex;
+            flex-direction: column;
+            width: 100%;
+            height: 60%;
+            border: 1px solid rgb(194, 186, 186);
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        #viewer-moves-list {
+            flex: 1;
+            min-height: 0;
+            contain: size;
+            overflow-y: auto;
+            overflow-x: hidden;
+            position: relative;
+            display: grid;
+            grid-template-columns: 3em minmax(0, 1fr);
+            grid-auto-rows: max-content;
+            align-content: start;
+            font-size: 11px;
+        }
+        .move-no {
+            padding: 2px 4px;
+            color: #666;
+        }
+        .move-cell {
+            padding: 2px 4px;
+            white-space: nowrap;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            cursor: pointer;
+        }
+        .move-cell:hover {
+            background-color: #f3dcbd;
+        }
+        .move-cell.current {
+            background-color: #e4b476;
+        }
+
+        #viewer-moves-nav, #game-control {
+            display: flex;
+            gap: 1px;
+            background-color: white;
+        }
+
+        #viewer-moves-nav button, #game-control button {
+            flex: 1;
+            padding: 4px;
+            border: none;
+            background-color: #e4b476;
+            cursor: pointer;
+        }
+
+        #game-control button:disabled {
+            background-color: #c99f69;
+        }
+
+        #game-control {
+            border-radius: 5px;
+            overflow: hidden;
+        }
+        
     </style>
 </head>
 <body style="background-color: white; font-family: 'Courier New', Courier, monospace;">
     <div id="main-container" style="display: flex; flex-direction: row; gap: 16px">
-        <div id="side-panel-left" style="flex: 2; min-width: 0; border: 4px solid black; border-radius: 8px; padding: 16px; display: flex; flex-direction: column;">
+        <div id="side-panel-left" style="flex: 1; min-width: 0; border: 4px solid black; border-radius: 8px; padding: 16px; gap: 16px; display: flex; flex-direction: column;">
             <div id="game-info-panel" class="section">
                 <p id="move"></p>
                 <p id="stm"></p>
             </div>
-            <div id="game-option-select" style="display: flex; margin-top: auto;">
-                <button onclick="restart_game()" style="width: 100%; height: 40px; border-radius: 5px; border: none; background-color: #e4b476;">Restart Game</button>
+            <div id="game-viewer" class="section" style="display: flex; flex-direction: column; height: 100%; align-items: center;">
+                <h1>Game Viewer</h1>
+                <div class="upload-wrapper">
+                    <button type="button" id="upload-btn">Choose File</button>
+                    <input type="file" id="gamefile-upload" accept=".tkn">
+                </div><br>
+                <div id="viewer-control" class="section" style="display: none; flex-direction: column; gap: 16px; width: 90%; height: 100%; align-items: center;">
+                    <div id="viewer-game-change-container" style="display: flex; height: 20px; width: 100%; justify-content: space-between;">
+                        <!-- you are telling me that there is NO WAY for me to get a raw < character other than using this stupid replacement -->
+                        <button class="fake-btn" onclick="load_prev_game()">
+                            &lt;
+                        </button>
+                        <div id="viewer-game-no">
+                            Game 1
+                        </div>
+                        <button class="fake-btn" onclick="load_next_game()">
+                            &gt;
+                        </button>
+                    </div>
+                    <div id="viewer-moves-container">
+                        <div id="viewer-moves-list"></div>
+                        <div id="viewer-moves-nav">
+                            <button onclick="loaded_games[game_index_selected].prev_move()">Previous</button><button onclick="loaded_games[game_index_selected].next_move()">Next</button>
+                        </div>
+                    </div>
+                </div>
+            </div>
+            <div id="game-option-select" style="display: flex; flex-direction: row; justify-content: space-between; gap: 16px; margin-top: auto;">
+                <button onclick="restart_game()" style="height: 40px; border-radius: 5px; border: none; background-color: #e47676;">Restart Game</button>
+                <button onclick="export_game()" style="height: 40px; border-radius: 5px; border: none; background-color: #e4b476;">Export Game to .tkn</button>
             </div>
         </div>
         <div id="grid" style="flex: 0 0 500px"></div>
-        <div id="side-panel" style="flex: 3; min-width: 0; border: 4px solid black; border-radius: 8px; padding: 16px; display: flex; flex-direction: column;">
+        <div id="side-panel" style="flex: 1; min-width: 0; border: 4px solid black; border-radius: 8px; padding: 16px; display: flex; flex-direction: column; gap: 16px;">
             <div id="inspector" class="section">
                 <h3 style="white-space: nowrap; margin-top: 5px; margin-bottom: 5px;">Piece Information</h3>
                 <div id="piece-info"></div>
                 <div id="piece-move-grid" style="display: none; gap: 1px; background: #333;"></div>
             </div>
-            <br><br>
+            <div id="game-control" style="margin-top: auto;">
+                <button onclick="if (!board.viewing) game_hist.prev_move()" class="game-control-button">Previous move</button>
+                <button onclick="if (!board.viewing) game_hist.next_move()" class="game-control-button">Next move</button>
+            </div>
             <div id="lookup" class="section">
                 <form id="lookup-form">
-                    <input type="text" id="piece-id-lookup"><br>
-                    <button type="submit" style="padding-top: 3px;">Find Piece</button>
+                    <p>Enter a piece name or a piece ID to highlight corresponding pieces on the board. (King is 1000)</p>
+                    <input type="text" id="piece-id-lookup">  <button type="submit" style="padding-top: 3px;">Find Piece</button>
                 </form>
-            </div><br><br>
-            <button id="testing" onclick="alert('hi!')">
-                Hello!
-            </button>
-            <input type="file" id="gamefile-upload" accept=".tkn">
+            </div>
+            <div id="info" style="font-size: 11px">
+                Useful Info:<br>
+                - pressing Alt-V rotates the board.<br>
+                - holding SHIFT displays alternate moves for certain range-capturing pieces.<br>
+                - holding X displays alternate moves for lion-like pieces that can move twice in one turn. (You must hold them down through the move.)<br>
+                - There is no check. Capturing the king wins the game. (There is also no formal win screen)<br>
+                - The crown prince is not royal and does not promote. (Yes, I know this is not faithful to the original game technically, but programming constraints forced my hand.)<br>
+                - When pieces promote, black becomes red and white becomes green.
+            </div>
         </div>
     </div>
     
     <!-- Importing javascripts -->
+    <!-- 
+    These two are the engine implementation that had been disabled.
     <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
-    <script src="engine.js" defer></script>
+    <script src="engine.js" defer></script> 
+    -->
     <script src="game.js" defer></script>
     <script src="grid.js" defer></script>
-    
 </body>
 </html>

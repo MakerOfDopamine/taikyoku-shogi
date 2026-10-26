@@ -8,7 +8,7 @@ const NONE = [0,0,0,0,0,0,0,0]
 const Q = [99,99,99,99,99,99,99,99]
 
 class Board {
-    constructor(base_board = null, turn = 1) {
+    constructor(base_board = null, turn = 1, viewing = false) {
         this.board = [
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
             [0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
@@ -49,6 +49,7 @@ class Board {
         ]
         this.turn = turn
         this.turn_no = 1
+        this.viewing = viewing
         if (base_board != null) {
             // Deep copy: never alias the caller's array. Coordinates are re-derived
             // from the actual position so a hand-built board can't disagree with itself.
@@ -502,6 +503,11 @@ class Board {
     move(start_x, start_y, move, no_promote = false) {
         // DOES NOT VALIDATE THE MOVE OR WHETHER A MOVEMENT IS "IN BOUNDS"!
         // Expects moves fed directly from the generator.
+
+        if (this.viewing) {
+            return; // Viewing mode does not allow moving
+        }
+
         let special = Math.floor(move / 1296)
         let target_x = Math.floor(move / 36) % 36
         let target_y = move % 36
@@ -945,280 +951,61 @@ class Piece {
 }
 
 class Game {
-    // stalemate_loses: side to move with no legal move loses (true) or draws (false).
-    // repetition_limit: identical position + side to move this many times is a draw.
-    // no_progress_limit: plies without a capture or promotion before a draw. 0 to disable.
-    constructor(board = null, options = {}) {
-        this.board = (board != null) ? board : new Board()
-        this.turn = 1
-        this.ply_count = 0
-        this.is_over = false
-        this.winner = null
-        this.result = null
-        this.history = []
-
-        this.stalemate_loses = (options.stalemate_loses !== undefined) ? options.stalemate_loses : true
-        this.repetition_limit = (options.repetition_limit !== undefined) ? options.repetition_limit : 4
-        this.no_progress_limit = (options.no_progress_limit !== undefined) ? options.no_progress_limit : 0
-
-        this.no_progress_plies = 0
-        this.position_counts = new Map()
-        this.position_counts.set(this.position_key(), 1)
+    constructor(positions = [], moves = [], metadata = {}) {
+        // positions = packed board after each ply (as in .tkn), moves = [x, y, move] for each ply
+        this.positions = positions
+        this.moves = moves
+        this.metadata = metadata
+        this.move = 0
+        this.tomove = 1
+        this.viewing = false
     }
 
-    snapshot() {
-        return this.board.board.map((row) => row.map((piece) => piece.copy(piece.x, piece.y)))
+    position(n) {
+        // Boards are built when shown. position n = ply n (0 = start)
+        if (n == 0) return new Board().board
+        return decode_board(this.positions[n - 1])
     }
 
-    position_key() {
-        let parts = []
-        for (let i = 0; i < 36; i++) {
-            for (let j = 0; j < 36; j++) {
-                let piece = this.board.board[i][j]
-                parts.push(piece.id === 0 ? "" : `${piece.id}${piece.color}${piece.promoted ? "p" : ""}`)
-            }
-        }
-        return parts.join(",") + "|" + this.turn
+    push(x, y, move) {
+        // Records the move just played on board, dropping any moves after the current one
+        this.positions.length = this.move
+        this.moves.length = this.move
+        this.positions.push(encode_board(board))
+        this.moves.push([x, y, move])
+        this.move += 1
+        this.tomove = 1 - this.tomove
     }
 
-    count_royals(color) {
-        let total = 0
-        for (let i = 0; i < 36; i++) {
-            for (let j = 0; j < 36; j++) {
-                let piece = this.board.board[i][j]
-                if (piece.id == 1000 && piece.color === color) {
-                    total += 1
-                }
-            }
-        }
-        return total
+    load() {
+        // jesus I should have named this something else
+        this.move = 0
+        this.tomove = 1
+        this.viewing = true
+        board = new Board(null, this.move, true)
+        board.board = this.position(0)
+        refresh()
+        build_move_list(this)
     }
 
-    royal_squares(color) {
-        let squares = []
-        for (let i = 0; i < 36; i++) {
-            for (let j = 0; j < 36; j++) {
-                let piece = this.board.board[i][j]
-                if (piece.id == 1000 && piece.color === color) {
-                    squares.push([i, j])
-                }
-            }
-        }
-        return squares
+    goto(n) {
+        this.move = n
+        this.tomove = n % 2 == 0 ? 1 : 0
+        board.board = this.position(n)
+        board.turn = this.tomove
+        board.turn_no = n + 1
+        refresh()
+        if (this.viewing) update_move_list(n)
     }
 
-    // For UI warning and for engine evaluation.
-    is_royal_capturable(color) {
-        let royals = this.royal_squares(color)
-        if (royals.length === 0) return false
-        for (let move of this.all_legal_moves(1 - color)) {
-            for (let square of this.squares_emptied(move[0], move[1], move[2])) {
-                for (let royal of royals) {
-                    if (square[0] === royal[0] && square[1] === royal[1]) return true
-                }
-            }
-        }
-        return false
+    next_move() {
+        if (this.move == this.positions.length) return;
+        this.goto(this.move + 1)
     }
 
-    // ---- move generation --------------------------------------------------
-
-    get_legal_moves(x, y) {
-        if (this.is_over) return []
-        if (out_of_bounds(x) || out_of_bounds(y)) return []
-        let piece = this.board.getPiece(x, y)
-        if (piece.is_empty() || piece.color !== this.turn) return []
-        return piece.get_legal_moves(this.board)
-    }
-
-    // [[x, y, move_code], ...] for every piece of "color".
-    all_legal_moves(color = this.turn) {
-        let all = []
-        for (let i = 0; i < 36; i++) {
-            for (let j = 0; j < 36; j++) {
-                let piece = this.board.board[i][j]
-                if (piece.is_empty() || piece.color !== color) continue
-                for (let move of piece.get_legal_moves(this.board)) {
-                    all.push([i, j, move])
-                }
-            }
-        }
-        return all
-    }
-
-    has_legal_move(color = this.turn) {
-        for (let i = 0; i < 36; i++) {
-            for (let j = 0; j < 36; j++) {
-                let piece = this.board.board[i][j]
-                if (piece.is_empty() || piece.color !== color) continue
-                if (piece.get_legal_moves(this.board).length > 0) return true
-            }
-        }
-        return false
-    }
-
-    // Which squares a move would vacate. Covers intermediate captures (special 1-8) and everything swept by a trample (special 9) as well as the final square.
-    squares_emptied(x, y, move) {
-        let special = Math.floor(move / 1296)
-        let target_x = Math.floor(move / 36) % 36
-        let target_y = move % 36
-        let squares = [[target_x, target_y]]
-        if (special >= 1 && special <= 8) {
-            let offset = ([[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]])[special - 1]
-            let mid_x = x + offset[0]
-            let mid_y = y + offset[1]
-            if (!out_of_bounds(mid_x) && !out_of_bounds(mid_y)) squares.push([mid_x, mid_y])
-        } else if (special === 9) {
-            let unit = [Math.sign(target_x - x), Math.sign(target_y - y)]
-            let size = Math.max(Math.abs(target_x - x), Math.abs(target_y - y))
-            for (let i = 1; i < size; i++) squares.push([x + i * unit[0], y + i * unit[1]])
-        }
-        return squares
-    }
-
-    move(x, y, move_code) {
-        if (this.is_over) return false
-        if (out_of_bounds(x) || out_of_bounds(y)) return false
-
-        let piece = this.board.getPiece(x, y)
-        if (piece.is_empty()) return false
-        if (piece.color !== this.turn) return false
-
-        if (!piece.get_legal_moves(this.board).includes(move_code)) return false
-
-        let before = this.snapshot()
-        let royals_before = [this.count_royals(0), this.count_royals(1)]
-        let was_promoted = piece.promoted
-        let mover = this.turn
-
-        try {
-            this.board.move(x, y, move_code)
-        } catch (error) {
-            this.board.board = before
-            console.log(error)
-            return false
-        }
-
-        let royals_after = [this.count_royals(0), this.count_royals(1)]
-        let captured = this.count_pieces(before) - this.count_pieces(this.board.board)
-        let promoted_now = this.board.getPiece(
-            Math.floor(move_code / 36) % 36, move_code % 36
-        ).promoted && !was_promoted
-
-        this.history.push({
-            code: 12960 * (x * 36 + y + (was_promoted ? 1 : 0) * 1296) + move_code,
-            from: [x, y],
-            move: move_code,
-            turn: mover,
-            before: before,
-            no_progress_plies: this.no_progress_plies,
-            position_key: this.position_key()
-        })
-
-        this.turn = 1 - this.turn
-        this.ply_count += 1
-        this.no_progress_plies = (captured > 0 || promoted_now) ? 0 : this.no_progress_plies + 1
-
-        if (royals_after[1 - mover] < royals_before[1 - mover]) {
-            this.finish(mover, RESULT_ROYAL_CAPTURE)
-            return true
-        }
-        if (royals_after[mover] < royals_before[mover]) {
-            this.finish(1 - mover, RESULT_ROYAL_CAPTURE)
-            return true
-        }
-
-        let key = this.position_key()
-        let seen = (this.position_counts.get(key) || 0) + 1
-        this.position_counts.set(key, seen)
-        if (this.repetition_limit > 0 && seen >= this.repetition_limit) {
-            this.finish(null, RESULT_REPETITION)
-            return true
-        }
-        if (this.no_progress_limit > 0 && this.no_progress_plies >= this.no_progress_limit) {
-            this.finish(null, RESULT_NO_PROGRESS)
-            return true
-        }
-        if (!this.has_legal_move(this.turn)) {
-            this.finish(this.stalemate_loses ? mover : null, RESULT_STALEMATE)
-        }
-        return true
-    }
-
-    count_pieces(grid) {
-        let total = 0
-        for (let i = 0; i < 36; i++) {
-            for (let j = 0; j < 36; j++) if (grid[i][j].id !== 0) total += 1
-        }
-        return total
-    }
-
-    finish(winner, result) {
-        this.is_over = true
-        this.winner = winner
-        this.result = result
-    }
-
-    undo() {
-        if (this.history.length === 0) return false
-        let record = this.history.pop()
-
-        let key = this.position_key()
-        let seen = this.position_counts.get(key)
-        if (seen !== undefined) {
-            if (seen <= 1) this.position_counts.delete(key)
-            else this.position_counts.set(key, seen - 1)
-        }
-
-        this.board.board = record.before
-        this.turn = record.turn
-        this.ply_count -= 1
-        this.no_progress_plies = record.no_progress_plies
-        this.is_over = false
-        this.winner = null
-        this.result = null
-        return true
-    }
-
-    // ---- results ----------------------------------------------------------
-
-    is_game_over() {
-        return this.is_over
-    }
-
-    get_winner() {
-        return this.winner  // 1 = Black, 0 = White, null = draw or unfinished
-    }
-
-    result_string() {
-        if (!this.is_over) return "in progress"
-        if (this.winner === null) return `draw (${this.result})`
-        return `${this.winner === 1 ? "Black" : "White"} wins (${this.result})`
-    }
-
-    clone() {
-        let copy = new Game(new Board(this.board.board), {
-            stalemate_loses: this.stalemate_loses,
-            repetition_limit: this.repetition_limit,
-            no_progress_limit: this.no_progress_limit
-        })
-        copy.turn = this.turn
-        copy.ply_count = this.ply_count
-        copy.is_over = this.is_over
-        copy.winner = this.winner
-        copy.result = this.result
-        copy.no_progress_plies = this.no_progress_plies
-        copy.position_counts = new Map(this.position_counts)
-        return copy
-    }
-
-    move_to_string(x, y, move_code) {
-        let special = Math.floor(move_code / 1296)
-        let target_x = Math.floor(move_code / 36) % 36
-        let target_y = move_code % 36
-        let name = this.board.getPiece(x, y).name
-        let kind = special === 0 ? "" : (special === 9 ? " (trample)" : " (via intermediate)")
-        return `${name} ${x},${y} -> ${target_x},${target_y}${kind}`
+    prev_move() {
+        if (this.move == 0) return;
+        this.goto(this.move - 1)
     }
 }
 
@@ -2165,7 +1952,7 @@ const VALUES = {
 }
 
 // Material value, not including promotion possibilities
-// Not exist in this dir = same as in VALUES (or the piece cannot promote at all)
+// Not exist in this object = same as in VALUES (or the piece cannot promote at all)
 const VALUES_PROMOTED = {
     1: 0.76,    // Pawn
     2: 1.16,    // Earth General
@@ -2363,11 +2150,237 @@ const material_value = (piece) => (piece.promoted && VALUES_PROMOTED[piece.id] !
     ? VALUES_PROMOTED[piece.id]
     : VALUES[piece.id]
 
-document.getElementById("gamefile-upload").addEventListener("change", async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
+// THE STUPID GAMEFILE 
+const magic = [0x54, 0x4B, 0x59, 0x4E, 0x4E, 0x53, 0x50, 0x00]
+let LOADED_SAVE = {}
 
-    const text = await file.text();
-    console.log(text); // do whatever with it
+function u16(bytes) {
+    // Helper function to convert two-byte slices into a single number.
+    return bytes[0] + bytes[1] * 256
+}
+
+function u32(bytes) {
+    // Helper function to convert four-byte slices into a single number.
+    return bytes[0] + bytes[1] * 256 + bytes[2] * 256 * 256 + bytes[3] * 256 * 256 * 256
+}
+
+function u64(bytes) {
+    // Helper function to convert eight-byte slices into a single number.
+    // NOTE THAT THIS IS UNSAFE ABOVE MAX SAFE INTEGER!
+    const val = (
+        bytes[0] + 
+        bytes[1] * 256 + 
+        bytes[2] * 256 ** 2 + 
+        bytes[3] * 256 ** 3 +
+        bytes[4] * 256 ** 4 +
+        bytes[5] * 256 ** 5 +
+        bytes[6] * 256 ** 6 +
+        bytes[7] * 256 ** 7
+    )
+    // This is equivalent to val > MAX_SAFE_INTEGER = 2^53 - 1. Above this roundoff errors make some integer values not representable.
+    if (bytes[7] !== 0 || bytes[6] > 31) console.warn("U64 conversion has produced a number above maximum safe integer.")
+    return val
+}
+
+let loaded_games; 
+document.getElementById("gamefile-upload").addEventListener("change", async (e) => {
+    // Me when I need to const
+    const file = e.target.files[0]
+    if (!file) return
+    if (file.size > (2 ** 30)) {
+        alert("File is too big!")
+        return
+    }
+    if (file.name.slice(-4) != ".tkn") {
+        alert("Invalid file extension!")
+        return
+    }
+
+    const buffer = await file.arrayBuffer()
+    const bytes = new Uint8Array(buffer)
+
+    const valid_file = magic.every((v, i) => bytes[i] === v);
+    if (!valid_file) {
+        alert("Invalid file! (Magic number mismatch. The file may be corrupted)")
+        return
+    }
+
+    // ew magic offsets
+    const HEADER_SIZE = u32(bytes.slice(12, 16))
+    const GAME_HEADER_SIZE = u32(bytes.slice(16, 20))
+    const RECORD_SIZE = u32(bytes.slice(20, 24))
+    const num_games = u32(bytes.slice(40, 48))
+    
+    loaded_games = {}
+
+    let offset_so_far = HEADER_SIZE
+    for (let game = 0; game < num_games; game++) {
+        let N_PLIES = u32(bytes.slice(offset_so_far, offset_so_far + 4))
+        let result = (bytes[offset_so_far + 4] << 24) >> 24 // 1 = black win, 0 = draw, -1 = white win
+        let termination_outcome = bytes[offset_so_far + 5]
+        offset_so_far += GAME_HEADER_SIZE
+
+        let positions = []
+        let moves = []
+        for (let j = 0; j < N_PLIES; j++) {
+            let m = u32(bytes.subarray(offset_so_far + 2592, offset_so_far + 2596))
+            let origin = (m >>> 17) & 0x7FF
+            positions.push(new Uint16Array(buffer, offset_so_far, 1296))
+            moves.push([Math.floor(origin / 36), origin % 36, (m >>> 28) * 1296 + ((m >>> 6) & 0x7FF)])
+            offset_so_far += RECORD_SIZE
+        }
+
+        let game_obj = new Game(positions, moves, {
+            "result": result,
+            "termination": termination_outcome,
+            "plycount": N_PLIES
+        })
+        loaded_games[game] = game_obj
+    }
+
+    document.getElementById("viewer-control").style.display = "flex";
+    for (let el of document.getElementsByClassName("game-control-button")) el.disabled = true;
+    game_index_selected = 0
+    loaded_games[0].load()
+    // Handle picking the same file again
+    e.target.value = ""
 });
 
+function decode_board(packed) {
+    // Builds a board from 1296 packed squares
+    let decoded = Array.from({ length: 36 }, () => Array(36).fill(0));
+    for (let k = 0; k < 1296; k++) {
+        let code = packed[k]
+        let x = Math.floor(k / 36)
+        let y = k % 36
+        if (code >> 2 == 301) {
+            decoded[x][y] = PIECES[1000].copy(x, y)
+        } else {
+            decoded[x][y] = PIECES[code >> 2].copy(x, y)
+        }
+
+        if ((code & 2) == 0) {
+            decoded[x][y].invert_color()
+        }
+
+        if ((code & 1) == 1) {
+            decoded[x][y].promoted = true
+        }
+    }
+    return decoded
+}
+
+function encode_board(b) {
+    // Packs b.board into 1296 squares: index << 2 | color << 1 | promoted
+    let packed = new Uint16Array(1296)
+    for (let x = 0; x < 36; x++) {
+        for (let y = 0; y < 36; y++) {
+            let piece = b.board[x][y]
+            packed[x * 36 + y] = ((piece.id == 1000 ? 301 : piece.id) << 2) | (piece.color << 1) | (piece.promoted ? 1 : 0)
+        }
+    }
+    return packed
+}
+
+function export_game() {
+    // only works for PLAYED games!
+    // Writes game_hist as a one-game .tkn (version 7), no search or values
+    const HEADER_SIZE = 256
+    const GAME_HEADER_SIZE = 16
+    const RECORD_SIZE = 2608
+    const plies = game_hist.positions.length
+    if (plies == 0) {
+        alert("No moves to export!")
+        return
+    }
+
+    const bytes = new Uint8Array(HEADER_SIZE + GAME_HEADER_SIZE + plies * RECORD_SIZE)
+    const view = new DataView(bytes.buffer)
+
+    // File header
+    bytes.set(magic, 0)
+    view.setUint32(8, 7, true)              // version
+    view.setUint32(12, HEADER_SIZE, true)
+    view.setUint32(16, GAME_HEADER_SIZE, true)
+    view.setUint32(20, RECORD_SIZE, true)
+    view.setUint32(24, 1000, true)          // piece values are in 1/1000 pawn
+    view.setUint32(28, 3, true)             // mat_shift: material is stored x 8
+    view.setBigUint64(40, 1n, true)         // games
+    view.setBigUint64(48, BigInt(plies), true)
+    view.setUint32(84, 36, true)            // board size
+    view.setUint32(88, 302, true)           // piece types
+    bytes.set(Array.from("human", c => c.charCodeAt(0)), 104)
+
+    // Game header
+    const last = game_hist.positions[plies - 1]
+    const kings = [0, 0]                    // [white, black]
+    for (let code of last) {
+        if (code >> 2 == 301) kings[(code >> 1) & 1] += 1
+    }
+    const result = kings[0] == 0 ? 1 : (kings[1] == 0 ? -1 : 0) // 1 = black win, 0 = draw, -1 = white win
+    view.setUint32(HEADER_SIZE, plies, true)
+    view.setInt8(HEADER_SIZE + 4, result)
+    view.setUint8(HEADER_SIZE + 5, result == 0 ? 4 : 0) // 0 = royal capture, 4 = ply cap (unfinished)
+    view.setInt16(HEADER_SIZE + 6, result * 10000, true)
+
+    // Records (value, legal moves and evaluations stay 0)
+    let prev = encode_board(new Board())
+    for (let n = 0; n < plies; n++) {
+        const at = HEADER_SIZE + GAME_HEADER_SIZE + n * RECORD_SIZE
+        const packed = game_hist.positions[n]
+        const [x, y, move] = game_hist.moves[n]
+        const origin = x * 36 + y
+        const target = move % 1296
+
+        let material = 0
+        let pieces_before = 0
+        let pieces_after = 0
+        for (let k = 0; k < 1296; k++) {
+            const code = packed[k]
+            const id = code >> 2
+            const value = ((code & 1) && VALUES_PROMOTED[id] !== undefined) ? VALUES_PROMOTED[id] : (VALUES[id] ?? 0)
+            material += ((code >> 1) & 1) ? value : -value
+            if (id != 0) pieces_after += 1
+            if ((prev[k] >> 2) != 0) pieces_before += 1
+        }
+        const mover = (packed[target] >> 1) & 1
+        const captured = pieces_after < pieces_before
+        const promoted = (packed[target] & 1) == 1 && (prev[origin] & 1) == 0
+        const flags = (captured ? 1 : 0) | (promoted ? 2 : 0) | (n == plies - 1 ? 8 : 0)
+
+        bytes.set(new Uint8Array(packed.buffer, packed.byteOffset, 2592), at)
+        view.setUint32(at + 2592, (Math.floor(move / 1296) << 28 | origin << 17 | target << 6) >>> 0, true)
+        view.setInt16(at + 2602, Math.round(material * 8), true)
+        view.setUint8(at + 2604, mover)
+        view.setUint8(at + 2605, flags)
+        prev = packed
+    }
+
+    const link = document.createElement("a")
+    link.href = URL.createObjectURL(new Blob([bytes]))
+    link.download = "game.tkn"
+    link.click()
+    setTimeout(() => URL.revokeObjectURL(link.href), 1000)
+}
+
+function load_next_game() {
+    const next_game = loaded_games[game_index_selected + 1]
+    if (next_game === undefined) {
+        return
+    }
+
+    game_index_selected += 1
+    document.getElementById("viewer-game-no").textContent = `Game ${game_index_selected + 1}`
+    next_game.load()
+}
+
+function load_prev_game() {
+    const prev_game = loaded_games[game_index_selected - 1]
+    if (prev_game === undefined) {
+        return
+    }
+
+    game_index_selected -= 1
+    document.getElementById("viewer-game-no").textContent = `Game ${game_index_selected + 1}`
+    prev_game.load()
+}

@@ -12,8 +12,8 @@ for (let i = 0; i < 1296; i++) {
     grid.appendChild(cell);
 }
 
-let global_game = new Game()
-let board = global_game.board // for ONCE the js laziness of only assigning references works in my favor
+let board = new Board() // for ONCE the js laziness of only assigning references works in my favor
+let game_hist = new Game() // the central game
 
 const DIRS = [[1, 0], [1, 1], [0, 1], [-1, 1], [-1, 0], [-1, -1], [0, -1], [1, -1]]
 
@@ -26,6 +26,8 @@ const COLOR_FIRST = "#6b3fa0"    // medium move, first leg (special 1-8, X)
 const COLOR_STANDING = "#3f7fd0" // square the piece is provisionally standing on
 const COLOR_SECOND = "#16cc5c"   // medium move, second leg
 const COLOR_SEARCH = "#26cad6"   // highlighted by search
+
+let game_index_selected = null
 
 // selected: origin square of the piece being moved, or [null, null].
 // intermediate: chosen first-leg direction as a special index 1-8, or null.
@@ -265,6 +267,7 @@ function refresh() {
     }
 
     update_ui()
+    update_board_info()
     if (selected[0] !== null) document.getElementById(`cell-${selected[0]}-${selected[1]}`).style.background = COLOR_SELECTED
 }
 
@@ -293,7 +296,7 @@ function click(x, y) {
             // Make the move if this is a real destination.
             let move = intermediate * 1296 + 36 * x + y
             if (moves_able.includes(move)) {
-                board.move(selected[0], selected[1], move)
+                play_move(selected[0], selected[1], move)
                 selected = [null, null]
                 intermediate = null
                 refresh()
@@ -309,7 +312,7 @@ function click(x, y) {
 
     let move = 1296 * (SHIFT ? 9 : 0) + 36 * x + y
     if (moves_able.includes(move)) {
-        board.move(selected[0], selected[1], move)
+        play_move(selected[0], selected[1], move)
         selected = [null, null]
         refresh()
         return
@@ -363,6 +366,126 @@ function flip_perspective() {
     return
 }
 
+function play_move(x, y, move) {
+    // Moves on the central board and records it in game_hist
+    let turn_before = board.turn
+    board.move(x, y, move)
+    if (board.turn != turn_before) game_hist.push(x, y, move)
+}
+
+function restart_game() {
+    board = new Board()
+    game_hist = new Game()
+    refresh()
+}
+
+// Move viewer
+const check_board = new Board(null, 1, true)
+let move_list_token = 0
+
+function move_text(game, n) {
+    // "(x, y) -> (x, y)" for ply n
+    let [x, y, move] = game.moves[n - 1]
+    let target = move % 1296
+    return `(${x}, ${y}) -> (${Math.floor(target / 36)}, ${target % 36})`
+}
+
+function hits_square(x, y, move, sq) {
+    // Whether the move from (x, y) captures the piece on sq
+    let special = Math.floor(move / 1296)
+    let target = move % 1296
+    if (target == sq) return true
+    if (special >= 1 && special <= 8) {
+        return (x + DIRS[special - 1][0]) * 36 + y + DIRS[special - 1][1] == sq
+    }
+    if (special == 9) {
+        let tx = Math.floor(target / 36)
+        let ty = target % 36
+        let dx = Math.sign(tx - x)
+        let dy = Math.sign(ty - y)
+        for (let cx = x + dx, cy = y + dy; cx != tx || cy != ty; cx += dx, cy += dy) {
+            if (cx * 36 + cy == sq) return true
+        }
+    }
+    return false
+}
+
+function attacks_king(b, mover) {
+    // Whether mover can take the enemy king next move
+    let king = null
+    for (let i = 0; i < 36; i++) {
+        for (let j = 0; j < 36; j++) {
+            if (b.board[i][j].id == 1000 && b.board[i][j].color != mover) king = i * 36 + j
+        }
+    }
+    if (king == null) return false
+
+    for (let i = 0; i < 36; i++) {
+        for (let j = 0; j < 36; j++) {
+            let piece = b.board[i][j]
+            if (piece.is_empty() || piece.color != mover) continue
+            for (let move of piece.get_legal_moves(b)) {
+                if (hits_square(i, j, move, king)) return true
+            }
+        }
+    }
+    return false
+}
+
+function mark_checks(game, n, token) {
+    // Adds "+" 25 plies at a time because adding all of them at once will freeze the game viewer when loading a game
+    if (token != move_list_token) return
+    let end = Math.min(n + 25, game.positions.length + 1)
+    for (; n < end; n++) {
+        check_board.board = game.position(n)
+        let target = game.moves[n - 1][2] % 1296
+        let mover = check_board.board[Math.floor(target / 36)][target % 36].color
+        if (attacks_king(check_board, mover)) {
+            document.getElementById(`move-${n}`).innerHTML += "+"
+        }
+    }
+    if (n <= game.positions.length) setTimeout(() => mark_checks(game, n, token), 0)
+}
+
+function build_move_list(game) {
+    const list = document.getElementById("viewer-moves-list")
+    list.innerHTML = ""
+    move_list_token += 1
+    for (let n = 1; n <= game.positions.length; n++) {
+        let no = document.createElement("div")
+        no.className = "move-no"
+        no.innerHTML = n % 2 == 1 ? `${(n + 1) / 2}.` : ""
+        list.appendChild(no)
+        let mcell = document.createElement("div")
+        mcell.className = "move-cell"
+        mcell.id = `move-${n}`
+        mcell.innerHTML = move_text(game, n)
+        mcell.addEventListener("click", () => {game.goto(n)})
+        list.appendChild(mcell)
+    }
+    list.scrollTop = 0
+    mark_checks(game, 1, move_list_token)
+}
+
+function update_move_list(n) {
+    // Highlights ply n and scrolls it into view
+    const list = document.getElementById("viewer-moves-list")
+    document.querySelector(".move-cell.current")?.classList.remove("current")
+    const current = document.getElementById(`move-${n}`)
+    if (current === null) return
+    current.classList.add("current")
+    if (current.offsetTop < list.scrollTop) {
+        list.scrollTop = current.offsetTop
+    } else if (current.offsetTop + current.offsetHeight > list.scrollTop + list.clientHeight) {
+        list.scrollTop = current.offsetTop + current.offsetHeight - list.clientHeight
+    }
+}
+
+function update_board_info() {
+    document.getElementById("move").innerHTML = `It is move ${board.turn_no}.`
+    document.getElementById("stm").innerHTML = `It is ${board.turn ? "black" : "white"}'s turn to move.`
+}
+
 for (let i = 0; i < 36; i++) {
     for (let j = 0; j < 36; j++) {
         cell(i, j).addEventListener('click', () => {click(i, j)})
@@ -379,8 +502,16 @@ window.addEventListener('keydown', (event) => {
         X_HELD = true
         intermediate = null
         refresh()
-    } else if ((event.code === 'KeyF' || event.key === 'f' || event.key === 'F') && event.altKey) {
+    } else if ((event.code === 'KeyV' || event.key === 'v' || event.key === 'V') && event.altKey) {
         flip_perspective()
+    } else if (event.code == 'ArrowLeft') {
+        if (game_index_selected !== null) {
+            loaded_games[game_index_selected].prev_move()
+        }
+    } else if (event.code == 'ArrowRight') {
+        if (game_index_selected !== null) {
+            loaded_games[game_index_selected].next_move()
+        }
     }
 });
 
@@ -402,16 +533,22 @@ window.addEventListener('mousedown', function(e) {
     }
 });
 
+// Piece Lookup
 document.getElementById("lookup-form").addEventListener("submit", (e) => {
     e.preventDefault();
     lookup_piece(document.getElementById('piece-id-lookup').value)
 });
 
+// Custom upload button
+document.getElementById("upload-btn").addEventListener("click", () => {
+    document.getElementById("gamefile-upload").click()
+});
+
 refresh()
+/*
 const gameLoop = setInterval(() => {
     if (board.turn != 1) {
         get_engine_move()
     }
-    document.getElementById("move").innerHTML = `It is move ${board.turn_no}.`
-    document.getElementById("stm").innerHTML = `It is ${board.turn ? "black" : "white"}'s turn to move.`
-}, 100)
+    
+}, 100)*/
