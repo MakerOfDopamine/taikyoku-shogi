@@ -16,7 +16,7 @@ The move generation was simpler but nontrivial still. I think that the the most 
 ### AI involvement in the board programming
 The board was purely self-made with only minor AI debugging pass, with the fixes for the highlighted bugs all manually written. The export format was taken directly from the `engines/` saga and so is written by Claude. I handled the bit-slicing aspects of reading the file, but was told that it is inefficient to load a large file (one of the primary other reasons I implemented a board viewer was to see *what on earth my models are failing to do*) and allocate the piece objects several billion times. After that, Claude basically rewrote most of my exportation and game logic code. (This is distinct from the board logic, because the Game logic mostly consists of storing game states linearly and stepping through them). 
 
-(I have been told many times before that I write like an AI being too objective, but I haven't been flagged for it until now. \O_O/?)
+(I have been told many times before that I write like an AI being too objective, but I haven't been flagged for it until now. This is very sad. \O_O/?)
 
 ### Implementational diferences
 My implementation differs from a faithful transcription in a few ways:
