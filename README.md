@@ -94,7 +94,7 @@ for each move (from, to, type):
     logit = q · k
 ```
 
-(Yes I did in fact spend 20 minutes drawing this stupid fucking chart instead of doing productive work.)
+(Yes I did in fact spend 20 minutes drawing this stupid chart instead of doing productive work.)
 
 # AI use
 I used AI for probably a far larger portion of programming than is ideal. Most of `engine/` files are contributed to by Claude Code as I do not know how to write C. AI also helped with some stylistic features in html/css which I did not know how to implement.
