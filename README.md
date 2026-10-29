@@ -30,6 +30,24 @@ Overall, I don't expect anyone to actually play this or look at it for anything 
 ### To run:
 Open `index.html` directly in the browser. No compilation is necessary.
 
+## FAQ:
+Q. Why is my board weird / lines too thick / sidebar squished?
+
+A. The game was developed on my resolution, and the size the characters at were about the smallest I can read them in. Please zoom out to make your screen wider.
+
+Q. How do I move?
+
+A. Click a piece on the board. I know they don't look like they're clickable, but they are. Click a pawn at the frontmost row.
+
+Q. Why can't I move?
+
+A. It's probably because it's the other side's turn. If it is not that, then it's because you're importing a game and you can't make custom moves in imported games.
+
+Q. What do the "Previous"/"Next" buttons at the side do?
+
+A. The buttons at the right side step you through the CURRENT game. The buttons at the left step you through the IMPORTED game.
+
+
 ## What is currently in this repo
 A complete implementation of the board is in `game.js`.
 
